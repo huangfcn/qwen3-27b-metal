@@ -1,0 +1,351 @@
+#ifndef QWEN38_M3_DECODE_H
+#define QWEN38_M3_DECODE_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+typedef struct qwen38_m3_model qwen38_m3_model;
+
+typedef struct {
+    uint32_t input_token;
+    uint32_t next_token;
+    uint32_t position;
+    double duration_ms;
+    size_t mapped_weight_bytes;
+    size_t state_bytes;
+    size_t kv_cache_bytes;
+    size_t physical_footprint_bytes;
+} qwen38_m3_decode_result;
+
+qwen38_m3_model *qwen38_m3_model_open(
+    const char *model_directory,
+    const char *metallib_path,
+    uint32_t context_capacity,
+    char *error_message,
+    size_t error_message_capacity);
+
+void qwen38_m3_model_reset(qwen38_m3_model *model);
+
+int qwen38_m3_model_decode(
+    qwen38_m3_model *model,
+    uint32_t token_id,
+    uint32_t position,
+    qwen38_m3_decode_result *result,
+    char *error_message,
+    size_t error_message_capacity);
+
+/* Runs one token through the static graph and exposes read-only logits until
+ * the next call. This is the C sampling interface; the model owns the data. */
+int qwen38_m3_model_forward(
+    qwen38_m3_model *model,
+    uint32_t token_id,
+    uint32_t position,
+    qwen38_m3_decode_result *result,
+    const float **logits,
+    size_t *logit_count,
+    char *error_message,
+    size_t error_message_capacity);
+
+typedef struct {
+    uint32_t token_count;
+    uint32_t chunk32_count;
+    uint32_t chunk16_count;
+    uint32_t single_count;
+    double duration_ms;
+    double first_chunk_ms;
+} qwen38_m3_prefill_result;
+
+/* Process a run of prompt tokens through batched prefill graphs (128-row
+ * chunks by default, 512-row trunks with QWEN38_PREFILL_MAX_CHUNK=512 on the
+ * half-tile GEMM levels), falling back to one-token forwards for a tail
+ * shorter than 16. Layer state after prefill is bitwise-identical to the
+ * same tokens pushed one at a time (with QWEN38_KV_Q8=1 both paths write
+ * the same quantized KV vectors, so they stay comparable); no logits are
+ * produced, so the caller
+ * forwards the final prompt token through qwen38_m3_model_forward for
+ * sampling. With QWEN38_PREFILL_PROGRESS=1 a line goes to stderr each time
+ * a quarter of the fill is crossed (25/50/75%) and on completion.
+ * QWEN38_FLASH_PREFILL=1 swaps the two-pass attention (materialized scores
+ * matrix + softmax/P.V) for a single-pass online-softmax kernel that never
+ * writes the scores matrix; its arithmetic order differs, so it is held to
+ * the token-parity standard rather than bitwise equality. Synchronous;
+ * on error the
+ * layer state is
+ * partially advanced and the caller should reset the model. */
+int qwen38_m3_model_prefill(
+    qwen38_m3_model *model,
+    const uint32_t *token_ids,
+    uint32_t token_count,
+    uint32_t start_position,
+    qwen38_m3_prefill_result *result,
+    char *error_message,
+    size_t error_message_capacity);
+
+/* Submit one token without waiting for Metal completion. The model owns one
+ * workspace and therefore permits exactly one in-flight forward. This split
+ * lets the caller overlap CPU detokenization and output with GPU execution. */
+int qwen38_m3_model_forward_submit(
+    qwen38_m3_model *model,
+    uint32_t token_id,
+    uint32_t position,
+    char *error_message,
+    size_t error_message_capacity);
+
+/* Wait for the submitted forward and expose its read-only logits until the
+ * next submit. Calling this without an in-flight forward is an error. */
+int qwen38_m3_model_forward_wait(
+    qwen38_m3_model *model,
+    qwen38_m3_decode_result *result,
+    const float **logits,
+    size_t *logit_count,
+    char *error_message,
+    size_t error_message_capacity);
+
+/* This process's current physical memory footprint in bytes (the number
+ * Activity Monitor shows for the process). Cheap; valid at any time. */
+size_t qwen38_m3_model_footprint(qwen38_m3_model *model);
+
+/* Multi-token prediction (greedy speculative decoding).
+ *
+ * qwen38_m3_model_mtp_open loads the MTP draft images; afterwards
+ * qwen38_m3_model_prefill also fills the draft layer's cache, and its
+ * token_ids argument must carry token_count + 1 entries (the token after
+ * the prefilled run). QWEN38_MTP_DEPTH (1..7, read at open) sets the
+ * draft depth: each step chains that many draft tokens through the MTP
+ * layer, verifies the pending token plus all drafts in one batched
+ * forward, and on a partial accept rolls the GDN state back to the last
+ * accepted row from the verify's factor checkpoints and hands the
+ * corrected token over as the next pending token. A step
+ * emits between one and depth + 1 tokens into emitted (up to 8);
+ * accepted receives the number of accepted drafts (0..depth).
+ * current_token carries the sampled-but-unprocessed token in and the
+ * next one out; the caller appends emitted and checks stop tokens. */
+int qwen38_m3_model_mtp_open(
+    qwen38_m3_model *model,
+    const char *layer_image_path,
+    const char *extras_image_path,
+    char *error_message,
+    size_t error_message_capacity);
+
+int qwen38_m3_model_mtp_step(
+    qwen38_m3_model *model,
+    uint32_t *current_token,
+    uint32_t *position,
+    uint32_t emitted[8],
+    uint32_t *emitted_count,
+    int *accepted,
+    char *error_message,
+    size_t error_message_capacity);
+
+/* Sampling-aware speculative MTP for temperature + top-k + top-p requests.
+ * Draft successors are sampled from the MTP proposal and accepted with
+ * min(1,p/q) against the batched target verification.  On rejection the
+ * next pending token is drawn from normalized max(p-q,0). */
+int qwen38_m3_model_mtp_sample_step(
+    qwen38_m3_model *model,
+    uint32_t *current_token,
+    uint32_t *position,
+    uint32_t emitted[8],
+    uint32_t *emitted_count,
+    int *accepted,
+    float temperature,
+    uint32_t top_k,
+    float top_p,
+    uint64_t *rng_state,
+    char *error_message,
+    size_t error_message_capacity);
+
+/* True depth-by-depth target beam for sampled MTP mode.  The already-sampled
+ * current token is fixed as the root; top-k target successors are expanded
+ * at every depth and pruned back to beam_width by cumulative target log
+ * probability.  This is intentionally occasional because it performs
+ * multiple target forwards. */
+int qwen38_m3_model_mtp_viterbi_sample_step(
+    qwen38_m3_model *model,
+    uint32_t *current_token,
+    uint32_t *position,
+    uint32_t emitted[8],
+    uint32_t *emitted_count,
+    uint32_t beam_width,
+    uint32_t depth,
+    float temperature,
+    uint32_t top_k,
+    float top_p,
+    uint64_t *rng_state,
+    double *best_score,
+    double *runner_score,
+    uint32_t *chosen_rank,
+    char *error_message,
+    size_t error_message_capacity);
+
+
+/* DFlash2 parallel speculative drafter.  The draft image is produced by
+ * compiler/qwen38_dflash2_pack.py from the official Qwen3.8-27B-DFlash2
+ * checkpoint.  The sampled step uses the same exact p/q acceptance and
+ * residual correction as sampled MTP, so draft quantization changes
+ * acceptance/speed but not the target sampling distribution. */
+int qwen38_m3_model_dflash2_open(
+    qwen38_m3_model *model,
+    const char *image_path,
+    char *error_message,
+    size_t error_message_capacity);
+
+/* DFlash2 diagnostic module tests. These are intended for the validation
+ * executable and do not change normal decoding.  validate checks all DFlash
+ * and target-verifier buffers/pipelines; propose runs only the parallel draft;
+ * verify runs only the target batch verifier and restores GDN state afterward. */
+int qwen38_m3_model_dflash2_test_validate(
+    qwen38_m3_model *model,
+    char *error_message,
+    size_t error_message_capacity);
+
+int qwen38_m3_model_dflash2_test_propose(
+    qwen38_m3_model *model,
+    uint32_t current_token,
+    uint32_t position,
+    uint32_t block,
+    uint32_t drafts[7],
+    uint32_t *draft_count,
+    char *error_message,
+    size_t error_message_capacity);
+
+int qwen38_m3_model_dflash2_test_verify(
+    qwen38_m3_model *model,
+    const uint32_t *tokens,
+    uint32_t batch,
+    uint32_t position,
+    char *error_message,
+    size_t error_message_capacity);
+
+int qwen38_m3_model_dflash2_sample_step(
+    qwen38_m3_model *model,
+    uint32_t *current_token,
+    uint32_t *position,
+    uint32_t emitted[8],
+    uint32_t *emitted_count,
+    int *accepted,
+    float temperature,
+    uint32_t top_k,
+    float top_p,
+    uint64_t *rng_state,
+    char *error_message,
+    size_t error_message_capacity);
+
+/* Adaptive Viterbi-style multi-path lookahead. Requires target logits from a
+ * preceding MTP step. The top beam_width pending-token hypotheses are each
+ * extended depth positions by the MTP draft model, target-verified, and
+ * scored by cumulative target log probability; only the winning path is
+ * committed. This is intentionally an occasional rescue/search path, not
+ * the normal fast single-chain MTP step. beam_width <= 8, depth <= 7. */
+int qwen38_m3_model_mtp_lattice_step(
+    qwen38_m3_model *model,
+    uint32_t *current_token,
+    uint32_t *position,
+    uint32_t emitted[8],
+    uint32_t *emitted_count,
+    uint32_t beam_width,
+    uint32_t depth,
+    double *best_score,
+    double *runner_score,
+    uint32_t *chosen_rank,
+    char *error_message,
+    size_t error_message_capacity);
+
+/* Expose the target-model distribution that produced current_token after the
+ * most recent MTP step. Intended for rare recovery actions such as sampling
+ * one escape token after detecting a repetition loop, without disabling
+ * greedy MTP for the whole reply. The pointer is model-owned and remains
+ * valid only until the next model operation. */
+int qwen38_m3_model_mtp_next_logits(
+    qwen38_m3_model *model,
+    const float **logits,
+    size_t *logit_count);
+
+/* Optional context view for lookup drafting: tokens must stay valid and
+ * cover the exact sequence the layer states correspond to (prompt plus
+ * emitted tokens, excluding the pending token). When the trigram ending
+ * at the pending token recurs in this context, the step drafts up to
+ * seven follower tokens from the context with no draft-model passes and
+ * verifies them in the usual batched forward. Pass NULL/0 to disable. */
+void qwen38_m3_model_mtp_context(
+    qwen38_m3_model *model,
+    const uint32_t *tokens,
+    uint32_t count);
+
+/* Conversation checkpoints: save copies the cumulative GDN
+ * recurrent/convolution states (the attention KV cache is per-position
+ * and needs no copy); restore rewinds to that point so a request that
+ * extends the saved prefix can prefill only its new suffix.
+ *
+ * Two slots, because two different prefixes are worth keeping:
+ *
+ *   QWEN38_M3_PREFIX_TURN    the last prompt boundary, rewritten every
+ *                            request, which serves follow-up turns of
+ *                            the conversation in flight.
+ *   QWEN38_M3_PREFIX_SYSTEM  a caller-declared prefix that outlives the
+ *                            conversation - for an agent front end, the
+ *                            system turn holding its instructions and
+ *                            tool schemas, which is identical across
+ *                            sessions and is otherwise re-prefilled from
+ *                            scratch every time one starts.
+ *
+ * A slot saved with kv_positions == 0 rewinds GDN state only, so the
+ * attention KV below the restore position must still hold that prefix's
+ * keys and values; that holds within one conversation. A slot saved
+ * with kv_positions mirrors the KV span too and therefore survives an
+ * unrelated request, including one that reset the caches. */
+enum {
+    QWEN38_M3_PREFIX_TURN = 0,
+    QWEN38_M3_PREFIX_SYSTEM = 1,
+    QWEN38_M3_PREFIX_SLOTS = 2
+};
+
+/* kv_positions mirrors that many leading positions of the attention KV
+ * into the slot as well. Pass 0 for a slot that is only used while the
+ * caches are known intact; pass the prefix length for one that must
+ * survive an unrelated request prefilling over the low positions. */
+int qwen38_m3_model_prefix_save_slot(
+    qwen38_m3_model *model,
+    uint32_t slot,
+    uint32_t kv_positions,
+    char *error_message,
+    size_t error_message_capacity);
+
+int qwen38_m3_model_prefix_restore_slot(
+    qwen38_m3_model *model,
+    uint32_t slot,
+    char *error_message,
+    size_t error_message_capacity);
+
+/* QWEN38_M3_PREFIX_TURN shorthands. */
+int qwen38_m3_model_prefix_save(
+    qwen38_m3_model *model,
+    char *error_message,
+    size_t error_message_capacity);
+
+int qwen38_m3_model_prefix_restore(
+    qwen38_m3_model *model,
+    char *error_message,
+    size_t error_message_capacity);
+
+enum {
+    QWEN38_M3_STATE_RECURRENT = 0,
+    QWEN38_M3_STATE_CONVOLUTION = 1,
+    QWEN38_M3_STATE_KEY_CACHE = 2,
+    QWEN38_M3_STATE_VALUE_CACHE = 3
+};
+
+/* Verification support: copy one layer's persistent state buffer. Returns
+ * the state byte count, or 0 if the layer/kind combination does not exist
+ * or the destination is too small. Recurrent and convolution state exist on
+ * DeltaNet layers; key/value caches exist on attention layers. */
+size_t qwen38_m3_model_copy_state(
+    qwen38_m3_model *model,
+    uint32_t layer_index,
+    uint32_t kind,
+    void *destination,
+    size_t destination_capacity);
+
+void qwen38_m3_model_close(qwen38_m3_model *model);
+
+#endif
