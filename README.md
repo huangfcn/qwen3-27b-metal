@@ -190,7 +190,7 @@ python server/qwen38_serve.py \
         --port 8080 \
         --thinking  \
         --context 65536 \
-        --max-tokens 20480
+        --max-tokens 16384
 ```
 
 The server serves both `POST /v1/chat/completions` and
