@@ -2197,15 +2197,16 @@ static size_t kv_cache_bytes(Q38DecodeRuntime *r) {
  * images are the only large file-backed allocations; KV and workspaces are
  * device buffers.
  *
- * QWEN38_PIN_WEIGHTS: unset = auto, pin only when physical RAM holds the
- * weights plus this model's KV cache plus a 6 GB headroom for the OS,
- * server and GPU working set; 1 = force; 0 = off. Failure is not fatal:
- * unpinned pages fall back to page-cache faults on first use, which is
- * exactly the pre-feature behavior. */
+ * QWEN38_PIN_WEIGHTS: unset/0 = off (default; unpinned pages fall back to
+ * page-cache faults on first use, the pre-feature behavior); 1 = force,
+ * skipping the RAM headroom check; any other value = auto, pin only when
+ * physical RAM holds the weights plus this model's KV cache plus a 6 GB
+ * headroom for the OS, server and GPU working set. Failure is not fatal:
+ * unpinned pages fall back to page-cache faults on first use. */
 static void pin_weight_mappings(Q38DecodeRuntime *r) {
     const char *env = getenv("QWEN38_PIN_WEIGHTS");
-    if (env != NULL && strcmp(env, "0") == 0) return; /* explicit off */
-    int forced = env != NULL && env[0] != '\0';
+    if (env == NULL || env[0] == '0') return; /* default off; 0 = off */
+    int forced = env[0] == '1';
     if (!forced) {
         uint64_t physical = 0;
         size_t length = sizeof(physical);
