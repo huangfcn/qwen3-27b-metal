@@ -10,7 +10,7 @@ The runtime is designed for real agent sessions, where source files, tool output
 
 A pure-Python compiler converts pinned checkpoints into fixed `.q38*` images; inference then runs entirely in C, Objective-C, and Metal with model-specific memory layouts and kernels.
 
-This project grew out of [`baryhuang/llm-in-c`](https://github.com/baryhuang/llm-in-c), a broader effort exploring model-specific inference across multiple models and hardware targets. The step-by-step development history and intermediate changes leading to this implementation are preserved in [`huangfcn/llm-in-c`](https://github.com/huangfcn/llm-in-c), primarily on the default `qwen3.9-27b-hybrid-q4` branch.
+This project grew out of [`baryhuang/llm-in-c`](https://github.com/baryhuang/llm-in-c), a broader effort exploring model-specific inference across multiple models and hardware targets. The step-by-step development history and intermediate changes leading to this implementation are preserved in [`huangfcn/llm-in-c`](https://github.com/huangfcn/llm-in-c), primarily on the default `qwen3.8-27b-hybrid-q4` branch.
 
 
 ## Hardware support
