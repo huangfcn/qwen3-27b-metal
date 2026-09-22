@@ -120,10 +120,16 @@ int main(int argc, char **argv) {
         uint32_t sequence[192];
         for (uint32_t index = 0; index < count; ++index)
             sequence[index] = kTokens[index % 36];
-        static const char *mode_names[3] = {"exact", "mma", "mma2"};
-        static const char *mode_env[3] = {"0", "1", "2"};
-        for (unsigned mode = 0; mode < 3; ++mode) {
+        /* Keep MMA2 at both a 32-token control and the production 128-token
+         * trunk. This separates half-MMA correctness from large-bucket
+         * scheduling and catches Apple8/M2-specific failures directly. */
+        static const char *mode_names[4] = {
+            "exact", "mma1", "mma2-32", "mma2-128"};
+        static const char *mode_env[4] = {"0", "1", "2", "2"};
+        static const char *chunk_env[4] = {"32", "32", "32", "128"};
+        for (unsigned mode = 0; mode < 4; ++mode) {
             setenv("QWEN38_PREFILL_MMA", mode_env[mode], 1);
+            setenv("QWEN38_PREFILL_MAX_CHUNK", chunk_env[mode], 1);
             qwen38_m3_model_reset(model);
             qwen38_m3_prefill_result prefill;
             if (qwen38_m3_model_prefill(model, sequence, count, 0,
@@ -141,6 +147,7 @@ int main(int argc, char **argv) {
 
             double max_abs = 0.0;
             unsigned nan_count = 0;
+            unsigned inf_count = 0;
             unsigned existence_mismatch = 0;
             int bitwise = 1;
             for (uint32_t layer = 0; layer < 64; ++layer) {
@@ -166,6 +173,10 @@ int main(int argc, char **argv) {
                             ++nan_count;
                             continue;
                         }
+                        if (isinf(now[index])) {
+                            ++inf_count;
+                            continue;
+                        }
                         double difference = fabs((double)now[index] -
                                                  (double)ref[index]);
                         if (difference > kStateRelativeTolerance *
@@ -176,6 +187,9 @@ int main(int argc, char **argv) {
                     free(now);
                 }
             }
+            unsigned logits_nonfinite = 0;
+            for (size_t index = 0; index < logit_count; ++index)
+                if (!isfinite(logits[index])) ++logits_nonfinite;
             uint32_t reference_best = argmax(reference_logits, logit_count);
             uint32_t candidate_best = argmax(logits, logit_count);
             int logits_bitwise = memcmp(reference_logits, logits,
@@ -192,19 +206,21 @@ int main(int argc, char **argv) {
              * token-identity batteries instead. */
             double scale = count > 32 ? (double)count / 32.0 : 1.0;
             double tolerance = scale *
-                (mode == 2 ? kStateToleranceHalfTile : kStateTolerance);
+                (mode >= 2 ? kStateToleranceHalfTile : kStateTolerance);
             int drift_gated = count <= 96;
-            int pass = nan_count == 0 && existence_mismatch == 0 &&
+            int pass = nan_count == 0 && inf_count == 0 &&
+                       logits_nonfinite == 0 && existence_mismatch == 0 &&
                        (!drift_gated || max_abs <= tolerance) &&
                        reference_best == candidate_best;
             printf("check=run%u mode=%s chunks=32x%u/16x%u/1x%u "
                    "bitwise_states=%s bitwise_logits=%s "
-                   "state_max_abs=%.9g nan=%u argmax=%u/%u status=%s\n",
+                   "state_max_abs=%.9g nan=%u inf=%u logits_nonfinite=%u "
+                   "argmax=%u/%u status=%s\n",
                    count, mode_names[mode],
                    prefill.chunk32_count, prefill.chunk16_count,
                    prefill.single_count, bitwise ? "yes" : "no",
                    logits_bitwise ? "yes" : "no", max_abs, nan_count,
-                   reference_best, candidate_best,
+                   inf_count, logits_nonfinite, reference_best, candidate_best,
                    pass ? "PASS" : "FAIL");
             if (!pass) ++failures;
         }

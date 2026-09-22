@@ -2253,12 +2253,11 @@ kernel void qwen38_prefill_q4_gemm_f32_residual_f32_mma(
  * (measured ~13-14 ms per layer for a 32-token chunk against a ~1.8 ms
  * weight-streaming floor), so the 2x-rate half pipes are the remaining
  * lever. Tiles are staged in half and consumed with half 8x8 MMAs; the
- * half accumulators spill into per-thread float accumulators every four
- * K-groups (256 columns), which bounds the half-precision accumulation
- * window. Gated by the argmax/token-parity standard like the float MMA
+ * MMA2 uses half A/B tiles with float accumulation for Apple8/M2
+ * portability; wider experimental paths below retain their own accumulation
+ * strategy. Gated by the argmax/token-parity standard like the float MMA
  * path; QWEN38_PREFILL_MMA=1 restores the float MMA, =0 the exact path. */
 
-constant uint kGemmSpillGroups = 1;
 
 /* All three variants read half activations directly from device memory
  * with strided simdgroup loads (no activation staging), so float
@@ -2278,33 +2277,38 @@ kernel void qwen38_prefill_convert_x(
 
 #define QWEN38_PREFILL_GEMM_MMA2_BODY(STORE)                              \
     threadgroup half w_tile[kGemmTileK * kGemmTileRows];                  \
-    threadgroup half spill[kGemmTileBatch * kGemmTileRows];               \
+    threadgroup float c_tile[kGemmTileBatch * kGemmTileRows];             \
     uint row0 = group_id.x * kGemmTileRows;                               \
     uint batch0 = group_id.y * kGemmTileBatch;                            \
     uint columns = p.groups_per_row * 64;                                 \
-    simdgroup_half8x8 accumulator[4];                                     \
+    /* Apple8/M2 is not reliable with a half accumulator here. Keep the     \
+     * fast half A/B matrix inputs, but accumulate in float. The same       \
+     * half*half->float simdgroup MMA form is already used by the Flash     \
+     * attention kernels in this file. */                                  \
+    simdgroup_float8x8 accumulator[4];                                    \
     for (uint n = 0; n < 4; ++n)                                          \
-        accumulator[n] = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);  \
-    float c_acc[8];                                                       \
-    for (uint i = 0; i < 8; ++i) c_acc[i] = 0.0f;                         \
+        accumulator[n] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f); \
     uint b0 = batch0 + simdgroup_index * 8;                               \
-    uint spill0 = simdgroup_index * 8;                                    \
+    uint tile_b0 = simdgroup_index * 8;                                   \
     uint r = tid & 31u;                                                   \
     uint k_base = (tid >> 5) * 16;                                        \
     for (uint group = 0; group < p.groups_per_row; ++group) {             \
         uint block = (row0 + r) * p.groups_per_row + group;               \
         Q4PrefillMeta meta = metadata[block];                             \
-        half scale = meta.scale;                                          \
-        half bias = meta.bias;                                            \
+        /* Dequantize in float, then narrow once for the MMA input tile. */ \
+        float scale = float(meta.scale);                                  \
+        float bias = float(meta.bias);                                    \
         device const uint *words = (device const uint *)                  \
             (quants + block * 32 + (k_base >> 1));                        \
         for (uint word = 0; word < 2; ++word) {                           \
             uint bits = words[word];                                      \
-            half4 lo = half4(as_type<uchar4>(bits & 0x0f0f0f0fu)) *       \
-                       scale + bias;                                      \
-            half4 hi = half4(as_type<uchar4>((bits >> 4) &                \
-                                             0x0f0f0f0fu)) *              \
-                       scale + bias;                                      \
+            float4 lo_f = float4(as_type<uchar4>(bits & 0x0f0f0f0fu)) *  \
+                          scale + bias;                                   \
+            float4 hi_f = float4(as_type<uchar4>((bits >> 4) &            \
+                                                 0x0f0f0f0fu)) *          \
+                          scale + bias;                                   \
+            half4 lo = half4(lo_f);                                       \
+            half4 hi = half4(hi_f);                                       \
             uint base = (k_base + word * 8) * kGemmTileRows + r;          \
             w_tile[base] = lo.x;                                          \
             w_tile[base + kGemmTileRows] = hi.x;                          \
@@ -2330,29 +2334,22 @@ kernel void qwen38_prefill_convert_x(
                                               accumulator[n]);            \
             }                                                             \
         }                                                                 \
+        /* All simdgroups must finish consuming w_tile before the next      \
+         * weight group overwrites it. */                                  \
         threadgroup_barrier(mem_flags::mem_threadgroup);                  \
-        if ((group & (kGemmSpillGroups - 1)) == kGemmSpillGroups - 1 ||   \
-            group == p.groups_per_row - 1) {                              \
-            for (uint n = 0; n < 4; ++n) {                                \
-                simdgroup_store(accumulator[n],                           \
-                                spill + spill0 * kGemmTileRows + n * 8,   \
-                                kGemmTileRows);                           \
-                accumulator[n] =                                          \
-                    make_filled_simdgroup_matrix<half, 8, 8>(0.0h);       \
-            }                                                             \
-            simdgroup_barrier(mem_flags::mem_threadgroup);                \
-            for (uint i = 0; i < 8; ++i)                                  \
-                c_acc[i] += float(spill[tid * 8 + i]);                    \
-            threadgroup_barrier(mem_flags::mem_threadgroup);              \
-        }                                                                 \
     }                                                                     \
+    for (uint n = 0; n < 4; ++n)                                          \
+        simdgroup_store(accumulator[n],                                   \
+                        c_tile + tile_b0 * kGemmTileRows + n * 8,         \
+                        kGemmTileRows);                                   \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                      \
     for (uint i = 0; i < 8; ++i) {                                        \
         uint linear = tid * 8 + i;                                        \
         uint b = batch0 + (linear >> 5);                                  \
         uint out_row = linear & 31u;                                      \
         if (b < kBatch) {                                                 \
             uint out_index = b * p.rows + row0 + out_row;                 \
-            float value = c_acc[i];                                       \
+            float value = c_tile[linear];                                 \
             STORE;                                                        \
         }                                                                 \
     }
@@ -2412,29 +2409,28 @@ kernel void qwen38_prefill_q4_gemm_f32_residual_f32_mma2(
 
 #define QWEN38_PREFILL_GEMM_Q8_MMA2_BODY(STORE)                           \
     threadgroup half w_tile[kGemmTileK * kGemmTileRows];                  \
-    threadgroup half spill[kGemmTileBatch * kGemmTileRows];               \
+    threadgroup float c_tile[kGemmTileBatch * kGemmTileRows];             \
     uint row0 = group_id.x * kGemmTileRows;                               \
     uint batch0 = group_id.y * kGemmTileBatch;                            \
     uint columns = p.groups_per_row * 64;                                 \
-    simdgroup_half8x8 accumulator[4];                                     \
+    simdgroup_float8x8 accumulator[4];                                    \
     for (uint n = 0; n < 4; ++n)                                          \
-        accumulator[n] = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);  \
-    float c_acc[8];                                                       \
-    for (uint i = 0; i < 8; ++i) c_acc[i] = 0.0f;                         \
+        accumulator[n] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f); \
     uint b0 = batch0 + simdgroup_index * 8;                               \
-    uint spill0 = simdgroup_index * 8;                                    \
+    uint tile_b0 = simdgroup_index * 8;                                   \
     uint r = tid & 31u;                                                   \
     uint k_base = (tid >> 5) * 16;                                        \
     for (uint group = 0; group < p.groups_per_row; ++group) {             \
         uint block = (row0 + r) * p.groups_per_row + group;               \
         Q4PrefillMeta meta = metadata[block];                             \
-        half scale = meta.scale;                                          \
-        half bias = meta.bias;                                            \
+        float scale = float(meta.scale);                                  \
+        float bias = float(meta.bias);                                    \
         device const uint *words = (device const uint *)                  \
             (quants + block * 64 + k_base);                               \
         for (uint word = 0; word < 4; ++word) {                           \
-            half4 w = half4(as_type<char4>(words[word])) *                \
-                       scale + bias;                                      \
+            float4 w_f = float4(as_type<char4>(words[word])) *            \
+                         scale + bias;                                    \
+            half4 w = half4(w_f);                                        \
             uint base = (k_base + word * 4) * kGemmTileRows + r;          \
             w_tile[base] = w.x;                                           \
             w_tile[base + kGemmTileRows] = w.y;                           \
@@ -2457,28 +2453,19 @@ kernel void qwen38_prefill_q4_gemm_f32_residual_f32_mma2(
             }                                                             \
         }                                                                 \
         threadgroup_barrier(mem_flags::mem_threadgroup);                  \
-        if ((group & (kGemmSpillGroups - 1)) == kGemmSpillGroups - 1 ||   \
-            group == p.groups_per_row - 1) {                              \
-            for (uint n = 0; n < 4; ++n) {                                \
-                simdgroup_store(accumulator[n],                           \
-                                spill + spill0 * kGemmTileRows + n * 8,   \
-                                kGemmTileRows);                           \
-                accumulator[n] =                                          \
-                    make_filled_simdgroup_matrix<half, 8, 8>(0.0h);       \
-            }                                                             \
-            simdgroup_barrier(mem_flags::mem_threadgroup);                \
-            for (uint i = 0; i < 8; ++i)                                  \
-                c_acc[i] += float(spill[tid * 8 + i]);                    \
-            threadgroup_barrier(mem_flags::mem_threadgroup);              \
-        }                                                                 \
     }                                                                     \
+    for (uint n = 0; n < 4; ++n)                                          \
+        simdgroup_store(accumulator[n],                                   \
+                        c_tile + tile_b0 * kGemmTileRows + n * 8,         \
+                        kGemmTileRows);                                   \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                      \
     for (uint i = 0; i < 8; ++i) {                                        \
         uint linear = tid * 8 + i;                                        \
         uint b = batch0 + (linear >> 5);                                  \
         uint out_row = linear & 31u;                                      \
         if (b < kBatch) {                                                 \
             uint out_index = b * p.rows + row0 + out_row;                 \
-            float value = c_acc[i];                                       \
+            float value = c_tile[linear];                                 \
             STORE;                                                        \
         }                                                                 \
     }
