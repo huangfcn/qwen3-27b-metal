@@ -1,4 +1,4 @@
-# qwen3-27b-apple-metal
+# Qwen3-27b-metal
 
 A high-performance Apple Silicon runtime for **Qwen3.8-27B**, optimized for long-context coding and agent workloads. It combines a hybrid **Q4 + Q8 quantization strategy**, optimized Metal kernels, Flash prefill, and speculative decoding to maintain useful throughput as context grows into the tens of thousands of tokens.
 
