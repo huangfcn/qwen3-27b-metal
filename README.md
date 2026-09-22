@@ -1,27 +1,15 @@
-# qwen27b-apple-metal
+# qwen3-27b-apple-metal
 
-A custom C / Objective-C runtime with Metal kernels that runs the Qwen 27B
-hybrid (DeltaNet + full-attention) language models end to end on Apple
-Silicon. It supports batched prompt prefill, incremental conversation state,
-greedy and sampled decoding, adaptive MTP and DFlash2 speculative decoding,
-and an OpenAI-compatible local server.
+A high-performance Apple Silicon runtime for **Qwen3.8-27B**, optimized for long-context coding and agent workloads. It combines a hybrid **Q4 + Q8 quantization strategy**, optimized Metal kernels, Flash prefill, and speculative decoding to maintain useful throughput as context grows into the tens of thousands of tokens.
 
-The measured record in this repository is for **Qwen3.8-27B** on an **Apple
-M3 Pro** (36 GB). Qwen3.6-27B shares the same graph shape (64 layers, 5,120
-hidden, 48 DeltaNet + 16 full-attention layers, 17,408 intermediate) and the
-same runtime; its checkpoint pins and measurements are a separate validation.
+Most weights use **affine Q4, group size 64** to minimize memory traffic. The exception is the DeltaNet input projection: the 48 recurrent DeltaNet layers keep `in_proj_qkv`, `in_proj_z`, `in_proj_a`, and `in_proj_b` in **Q8**, because errors there feed persistent recurrent state and can accumulate across tokens. This preserves most of Q4's bandwidth advantage while improving numerical stability.
 
-This runtime is designed around **agent workloads, not short-context headline
-throughput**. Coding agents repeatedly append source files, tool results,
-patches, compiler output and conversation history, so useful sessions quickly
-grow far beyond 8K tokens. Both prompt-prefill speed and generation speed at
-32K–80K context therefore matter more than peak throughput on a short prompt.
+Generation supports both **MTP** and **DFlash2** speculation. MTP drafts a short sequential token chain and verifies it in one batched target-model pass; an adaptive **Viterbi-style MTP** path can occasionally explore multiple continuations and select the strongest target-scored path. DFlash2 uses a compact five-layer draft network to propose tokens in parallel, followed by target-model verification.
 
-This runtime is a model-specific compiler output: the offline tools in
-`compiler/` turn the pinned checkpoint shards into packed runtime images
-(`.q38*` files) that the runtime maps directly. There is no general model
-loader and no external dependency — only the C/Objective-C/Metal stdlib and
-the system Metal, Foundation, CoreFoundation and ICU libraries.
+The runtime is designed for real agent sessions, where source files, tool output, patches, and conversation history routinely push context to **32K–80K tokens**. On the measured M3 Pro configuration, prefill remains about **63 tok/s at 32K, 54 tok/s at 48K, 48 tok/s at 64K, and 43–44 tok/s near 80K**.
+
+A pure-Python compiler converts pinned checkpoints into fixed `.q38*` images; inference then runs entirely in C, Objective-C, and Metal with model-specific memory layouts and kernels.
+
 
 ## Hardware support
 
@@ -195,7 +183,12 @@ QWEN38_MODEL_DIR=./models/qwen38-runtime \
     commands/qwen38_chat.sh 'Explain pages.'
 
 # OpenAI-compatible server (http://127.0.0.1:8080/v1)
-python3 server/qwen38_serve.py --model-dir ./models/qwen38-runtime
+python server/qwen38_serve.py \
+        --model-dir ./models/qwen38-runtime \
+        --port 8080 \
+        --thinking  \
+        --context 65536 \
+        --max-tokens 20480
 ```
 
 The server serves both `POST /v1/chat/completions` and

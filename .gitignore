@@ -1,11 +1,14 @@
+# Mac specific
 .DS_Store
+
+# python caches
 __pycache__/
+
+# build and tmp folders
 /build/
 /tmp/
-/tests/fixtures/gemma4_layer_official_*.bin
-*.safetensors.ranges.json
-*.g4task
-*.g4task.json
-*.whenc
-*.whenc.json
+
 .gstack/
+
+# local model files
+models/
