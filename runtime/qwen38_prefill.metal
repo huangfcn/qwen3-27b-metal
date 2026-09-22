@@ -2518,6 +2518,250 @@ kernel void qwen38_prefill_q8_gemm_f16_mma2(
 #undef STORE_PLAIN_Q8_2
 }
 
+
+/* Experimental portable wide MMA2 tiles. These retain the M2-safe
+ * half-input / FP32-accumulator arithmetic of MMA2, but widen the output
+ * tile to 48 or 64 rows to reduce activation-fragment loads and barrier
+ * rounds. Select through QWEN38_PREFILL_MMA_ROWS while MMA level == 2. */
+constant uint kGemmMma2Rows48 = 48;
+constant uint kGemmMma2Rows64 = 64;
+
+#define QWEN38_PREFILL_GEMM_MMA2W_BODY(ROWS, ACCS, ITEMS, STORE)           \
+    threadgroup half w_tile[kGemmTileK * (ROWS)];                         \
+    threadgroup float c_tile[kGemmTileBatch * (ROWS)];                    \
+    uint row0 = group_id.x * (ROWS);                                      \
+    uint batch0 = group_id.y * kGemmTileBatch;                            \
+    uint columns = p.groups_per_row * 64;                                 \
+    simdgroup_float8x8 accumulator[ACCS];                                 \
+    for (uint n = 0; n < (ACCS); ++n)                                     \
+        accumulator[n] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f); \
+    uint b0 = batch0 + simdgroup_index * 8;                               \
+    uint tile_b0 = simdgroup_index * 8;                                   \
+    uint load_threads = (ROWS) * 2;                                       \
+    bool load_active = tid < load_threads;                                \
+    uint r = load_active ? tid % (ROWS) : 0;                              \
+    uint k_base = load_active ? (tid / (ROWS)) * 32 : 0;                  \
+    for (uint group = 0; group < p.groups_per_row; ++group) {             \
+        if (load_active) {                                                \
+            if (row0 + r < p.rows) {                                      \
+                uint block = (row0 + r) * p.groups_per_row + group;       \
+                Q4PrefillMeta meta = metadata[block];                     \
+                float scale = float(meta.scale);                          \
+                float bias = float(meta.bias);                            \
+                device const uint *words = (device const uint *)          \
+                    (quants + block * 32 + (k_base >> 1));                \
+                for (uint word = 0; word < 4; ++word) {                   \
+                    uint bits = words[word];                              \
+                    float4 lo_f =                                         \
+                        float4(as_type<uchar4>(bits & 0x0f0f0f0fu)) *     \
+                        scale + bias;                                     \
+                    float4 hi_f = float4(as_type<uchar4>(                 \
+                        (bits >> 4) & 0x0f0f0f0fu)) * scale + bias;       \
+                    half4 lo = half4(lo_f);                               \
+                    half4 hi = half4(hi_f);                               \
+                    uint base = (k_base + word * 8) * (ROWS) + r;         \
+                    w_tile[base] = lo.x;                                  \
+                    w_tile[base + (ROWS)] = hi.x;                         \
+                    w_tile[base + 2 * (ROWS)] = lo.y;                     \
+                    w_tile[base + 3 * (ROWS)] = hi.y;                     \
+                    w_tile[base + 4 * (ROWS)] = lo.z;                     \
+                    w_tile[base + 5 * (ROWS)] = hi.z;                     \
+                    w_tile[base + 6 * (ROWS)] = lo.w;                     \
+                    w_tile[base + 7 * (ROWS)] = hi.w;                     \
+                }                                                         \
+            } else {                                                      \
+                for (uint i = 0; i < 32; ++i)                             \
+                    w_tile[(k_base + i) * (ROWS) + r] = 0.0h;             \
+            }                                                             \
+        }                                                                 \
+        threadgroup_barrier(mem_flags::mem_threadgroup);                  \
+        for (uint kk = 0; kk < kGemmTileK; kk += 8) {                     \
+            simdgroup_half8x8 a;                                          \
+            simdgroup_load(a, x + b0 * columns + group * 64 + kk,         \
+                           columns);                                      \
+            for (uint n = 0; n < (ACCS); ++n) {                           \
+                simdgroup_half8x8 b_fragment;                             \
+                simdgroup_load(b_fragment,                                \
+                               w_tile + kk * (ROWS) + n * 8, (ROWS));     \
+                simdgroup_multiply_accumulate(accumulator[n], a,          \
+                                              b_fragment, accumulator[n]); \
+            }                                                             \
+        }                                                                 \
+        threadgroup_barrier(mem_flags::mem_threadgroup);                  \
+    }                                                                     \
+    for (uint n = 0; n < (ACCS); ++n)                                     \
+        simdgroup_store(accumulator[n],                                   \
+                        c_tile + tile_b0 * (ROWS) + n * 8, (ROWS));       \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                      \
+    for (uint i = 0; i < (ITEMS); ++i) {                                  \
+        uint linear = tid * (ITEMS) + i;                                  \
+        uint local_b = linear / (ROWS);                                   \
+        uint out_row = linear - local_b * (ROWS);                         \
+        uint b = batch0 + local_b;                                        \
+        if (b < kBatch && row0 + out_row < p.rows) {                      \
+            uint out_index = b * p.rows + row0 + out_row;                 \
+            float value = c_tile[linear];                                 \
+            STORE;                                                        \
+        }                                                                 \
+    }
+
+#define DECLARE_Q4_MMA2W_KERNELS(SUFFIX, ROWS, ACCS, ITEMS)               \
+kernel void qwen38_prefill_q4_gemm_f16_mma2w##SUFFIX(                    \
+    device const half *x [[buffer(0)]],                                   \
+    device const uchar *quants [[buffer(1)]],                             \
+    device const Q4PrefillMeta *metadata [[buffer(2)]],                   \
+    device float *output [[buffer(3)]],                                   \
+    constant PrefillGemmParams &p [[buffer(4)]],                          \
+    uint tid [[thread_index_in_threadgroup]],                             \
+    uint simdgroup_index [[simdgroup_index_in_threadgroup]],              \
+    uint3 group_id [[threadgroup_position_in_grid]]) {                    \
+    QWEN38_PREFILL_GEMM_MMA2W_BODY(ROWS, ACCS, ITEMS,                    \
+        output[out_index] = value)                                        \
+}                                                                         \
+kernel void qwen38_prefill_q4_gate_silu_mma2w##SUFFIX(                   \
+    device const half *x [[buffer(0)]],                                   \
+    device const uchar *quants [[buffer(1)]],                             \
+    device const Q4PrefillMeta *metadata [[buffer(2)]],                   \
+    device float *output [[buffer(3)]],                                   \
+    constant PrefillGemmParams &p [[buffer(4)]],                          \
+    uint tid [[thread_index_in_threadgroup]],                             \
+    uint simdgroup_index [[simdgroup_index_in_threadgroup]],              \
+    uint3 group_id [[threadgroup_position_in_grid]]) {                    \
+    QWEN38_PREFILL_GEMM_MMA2W_BODY(ROWS, ACCS, ITEMS,                    \
+        output[out_index] = value / (1.0f + exp(-value)))                \
+}                                                                         \
+kernel void qwen38_prefill_q4_up_mul_mma2w##SUFFIX(                      \
+    device const half *x [[buffer(0)]],                                   \
+    device const uchar *quants [[buffer(1)]],                             \
+    device const Q4PrefillMeta *metadata [[buffer(2)]],                   \
+    device const float *gate_silu [[buffer(3)]],                          \
+    device float *output [[buffer(4)]],                                   \
+    constant PrefillGemmParams &p [[buffer(5)]],                          \
+    uint tid [[thread_index_in_threadgroup]],                             \
+    uint simdgroup_index [[simdgroup_index_in_threadgroup]],              \
+    uint3 group_id [[threadgroup_position_in_grid]]) {                    \
+    QWEN38_PREFILL_GEMM_MMA2W_BODY(ROWS, ACCS, ITEMS,                    \
+        output[out_index] = value * gate_silu[out_index])                \
+}                                                                         \
+kernel void qwen38_prefill_q4_gemm_f32_residual_f16_mma2w##SUFFIX(       \
+    device const half *x [[buffer(0)]],                                   \
+    device const uchar *quants [[buffer(1)]],                             \
+    device const Q4PrefillMeta *metadata [[buffer(2)]],                   \
+    device const half *residual [[buffer(3)]],                            \
+    device float *output [[buffer(4)]],                                   \
+    constant PrefillGemmParams &p [[buffer(5)]],                          \
+    uint tid [[thread_index_in_threadgroup]],                             \
+    uint simdgroup_index [[simdgroup_index_in_threadgroup]],              \
+    uint3 group_id [[threadgroup_position_in_grid]]) {                    \
+    QWEN38_PREFILL_GEMM_MMA2W_BODY(ROWS, ACCS, ITEMS,                    \
+        output[out_index] = value + float(residual[out_index]))          \
+}                                                                         \
+kernel void qwen38_prefill_q4_gemm_f32_residual_f32_mma2w##SUFFIX(       \
+    device const half *x [[buffer(0)]],                                   \
+    device const uchar *quants [[buffer(1)]],                             \
+    device const Q4PrefillMeta *metadata [[buffer(2)]],                   \
+    device const float *residual [[buffer(3)]],                           \
+    device float *output [[buffer(4)]],                                   \
+    constant PrefillGemmParams &p [[buffer(5)]],                          \
+    uint tid [[thread_index_in_threadgroup]],                             \
+    uint simdgroup_index [[simdgroup_index_in_threadgroup]],              \
+    uint3 group_id [[threadgroup_position_in_grid]]) {                    \
+    QWEN38_PREFILL_GEMM_MMA2W_BODY(ROWS, ACCS, ITEMS,                    \
+        output[out_index] = value + residual[out_index])                 \
+}
+
+DECLARE_Q4_MMA2W_KERNELS(48, kGemmMma2Rows48, 6, 12)
+DECLARE_Q4_MMA2W_KERNELS(64, kGemmMma2Rows64, 8, 16)
+#undef DECLARE_Q4_MMA2W_KERNELS
+
+#define QWEN38_PREFILL_GEMM_Q8_MMA2W_BODY(ROWS, ACCS, ITEMS, STORE)       \
+    threadgroup half w_tile[kGemmTileK * (ROWS)];                         \
+    threadgroup float c_tile[kGemmTileBatch * (ROWS)];                    \
+    uint row0 = group_id.x * (ROWS);                                      \
+    uint batch0 = group_id.y * kGemmTileBatch;                            \
+    uint columns = p.groups_per_row * 64;                                 \
+    simdgroup_float8x8 accumulator[ACCS];                                 \
+    for (uint n = 0; n < (ACCS); ++n)                                     \
+        accumulator[n] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f); \
+    uint b0 = batch0 + simdgroup_index * 8;                               \
+    uint tile_b0 = simdgroup_index * 8;                                   \
+    uint load_threads = (ROWS) * 2;                                       \
+    bool load_active = tid < load_threads;                                \
+    uint r = load_active ? tid % (ROWS) : 0;                              \
+    uint k_base = load_active ? (tid / (ROWS)) * 32 : 0;                  \
+    for (uint group = 0; group < p.groups_per_row; ++group) {             \
+        if (load_active) {                                                \
+            if (row0 + r < p.rows) {                                      \
+                uint block = (row0 + r) * p.groups_per_row + group;       \
+                Q4PrefillMeta meta = metadata[block];                     \
+                float scale = float(meta.scale);                          \
+                float bias = float(meta.bias);                            \
+                device const uint *words = (device const uint *)          \
+                    (quants + block * 64 + k_base);                       \
+                for (uint word = 0; word < 8; ++word) {                   \
+                    float4 w_f = float4(as_type<char4>(words[word])) *    \
+                                 scale + bias;                            \
+                    half4 w = half4(w_f);                                 \
+                    uint base = (k_base + word * 4) * (ROWS) + r;         \
+                    w_tile[base] = w.x;                                   \
+                    w_tile[base + (ROWS)] = w.y;                          \
+                    w_tile[base + 2 * (ROWS)] = w.z;                      \
+                    w_tile[base + 3 * (ROWS)] = w.w;                      \
+                }                                                         \
+            } else {                                                      \
+                for (uint i = 0; i < 32; ++i)                             \
+                    w_tile[(k_base + i) * (ROWS) + r] = 0.0h;             \
+            }                                                             \
+        }                                                                 \
+        threadgroup_barrier(mem_flags::mem_threadgroup);                  \
+        for (uint kk = 0; kk < kGemmTileK; kk += 8) {                     \
+            simdgroup_half8x8 a;                                          \
+            simdgroup_load(a, x + b0 * columns + group * 64 + kk,         \
+                           columns);                                      \
+            for (uint n = 0; n < (ACCS); ++n) {                           \
+                simdgroup_half8x8 b_fragment;                             \
+                simdgroup_load(b_fragment,                                \
+                               w_tile + kk * (ROWS) + n * 8, (ROWS));     \
+                simdgroup_multiply_accumulate(accumulator[n], a,          \
+                                              b_fragment, accumulator[n]); \
+            }                                                             \
+        }                                                                 \
+        threadgroup_barrier(mem_flags::mem_threadgroup);                  \
+    }                                                                     \
+    for (uint n = 0; n < (ACCS); ++n)                                     \
+        simdgroup_store(accumulator[n],                                   \
+                        c_tile + tile_b0 * (ROWS) + n * 8, (ROWS));       \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                      \
+    for (uint i = 0; i < (ITEMS); ++i) {                                  \
+        uint linear = tid * (ITEMS) + i;                                  \
+        uint local_b = linear / (ROWS);                                   \
+        uint out_row = linear - local_b * (ROWS);                         \
+        uint b = batch0 + local_b;                                        \
+        if (b < kBatch && row0 + out_row < p.rows) {                      \
+            uint out_index = b * p.rows + row0 + out_row;                 \
+            float value = c_tile[linear];                                 \
+            STORE;                                                        \
+        }                                                                 \
+    }
+
+#define DECLARE_Q8_MMA2W_KERNEL(SUFFIX, ROWS, ACCS, ITEMS)                \
+kernel void qwen38_prefill_q8_gemm_f16_mma2w##SUFFIX(                    \
+    device const half *x [[buffer(0)]],                                   \
+    device const uchar *quants [[buffer(1)]],                             \
+    device const Q4PrefillMeta *metadata [[buffer(2)]],                   \
+    device float *output [[buffer(3)]],                                   \
+    constant PrefillGemmParams &p [[buffer(4)]],                          \
+    uint tid [[thread_index_in_threadgroup]],                             \
+    uint simdgroup_index [[simdgroup_index_in_threadgroup]],              \
+    uint3 group_id [[threadgroup_position_in_grid]]) {                    \
+    QWEN38_PREFILL_GEMM_Q8_MMA2W_BODY(ROWS, ACCS, ITEMS,                 \
+        output[out_index] = value)                                        \
+}
+
+DECLARE_Q8_MMA2W_KERNEL(48, kGemmMma2Rows48, 6, 12)
+DECLARE_Q8_MMA2W_KERNEL(64, kGemmMma2Rows64, 8, 16)
+#undef DECLARE_Q8_MMA2W_KERNEL
+
 /* Small-batch half MMA: the speculative verify runs at batch 2-8, where
  * the 32-wide batch tile above pays for four times the useful math. This
  * variant keeps the same cooperative weight staging and per-group float

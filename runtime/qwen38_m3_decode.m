@@ -75,6 +75,8 @@ enum {
     id<MTLComputePipelineState> gemm_f16_q8_scalar;
     /* Q8 half MMA twin of gemm_f16_mma2 (Milestone B). */
     id<MTLComputePipelineState> gemm_f16_q8_mma2;
+    id<MTLComputePipelineState> gemm_f16_q8_mma2w48;
+    id<MTLComputePipelineState> gemm_f16_q8_mma2w64;
     /* Q8 wide-tile half MMA twin of gemm_f16_mma3 (Milestone B). */
     id<MTLComputePipelineState> gemm_f16_q8_mma3;
     /* Q8 wide small-batch half MMA twin of gemm_f16_mma8w (Milestone B). */
@@ -85,8 +87,14 @@ enum {
     id<MTLComputePipelineState> gemm_f32_residual_f16_mma;
     id<MTLComputePipelineState> gemm_f32_residual_f32_mma;
     id<MTLComputePipelineState> gemm_f16_mma2;
+    id<MTLComputePipelineState> gemm_f16_mma2w48;
+    id<MTLComputePipelineState> gemm_f16_mma2w64;
     id<MTLComputePipelineState> mlp_gate_silu_mma2;
+    id<MTLComputePipelineState> mlp_gate_silu_mma2w48;
+    id<MTLComputePipelineState> mlp_gate_silu_mma2w64;
     id<MTLComputePipelineState> mlp_up_mul_mma2;
+    id<MTLComputePipelineState> mlp_up_mul_mma2w48;
+    id<MTLComputePipelineState> mlp_up_mul_mma2w64;
     id<MTLComputePipelineState> gemm_f16_mma3;
     id<MTLComputePipelineState> mlp_gate_up_silu_mma3;
     id<MTLComputePipelineState> mlp_gate_silu_mma3;
@@ -95,7 +103,11 @@ enum {
     id<MTLComputePipelineState> gemm_f32_residual_f32_mma3;
     id<MTLComputePipelineState> convert_x;
     id<MTLComputePipelineState> gemm_f32_residual_f16_mma2;
+    id<MTLComputePipelineState> gemm_f32_residual_f16_mma2w48;
+    id<MTLComputePipelineState> gemm_f32_residual_f16_mma2w64;
     id<MTLComputePipelineState> gemm_f32_residual_f32_mma2;
+    id<MTLComputePipelineState> gemm_f32_residual_f32_mma2w48;
+    id<MTLComputePipelineState> gemm_f32_residual_f32_mma2w64;
     id<MTLComputePipelineState> silu_mul;
     id<MTLComputePipelineState> delta_conv;
     id<MTLComputePipelineState> delta_prepare;
@@ -311,6 +323,9 @@ enum {
     size_t state_bytes;
     size_t kv_bytes;
     int prefill_mma_level;
+    /* Output-row tile for the portable MMA2 path. 32 is the validated M2
+     * baseline; 48/64 are experimental wider FP32-accumulator tiles. */
+    int prefill_mma_rows;
     /* Smallest batch routed to the simdgroup-matrix GEMM kernels. Those
      * kernels pay for a full 32-row batch tile regardless of the real
      * batch (~513 ms at batch 2, flat through 8), so the verify batches
@@ -1048,6 +1063,8 @@ static Q38PrefillPipelines *prefill_pipelines(
     MAKE_PREFILL(gemm_f16, @"qwen38_prefill_q4_gemm_f16");
     MAKE_PREFILL(gemm_f16_q8_scalar, @"qwen38_prefill_q8_gemm_f16_scalar");
     MAKE_PREFILL(gemm_f16_q8_mma2, @"qwen38_prefill_q8_gemm_f16_mma2");
+    MAKE_PREFILL(gemm_f16_q8_mma2w48, @"qwen38_prefill_q8_gemm_f16_mma2w48");
+    MAKE_PREFILL(gemm_f16_q8_mma2w64, @"qwen38_prefill_q8_gemm_f16_mma2w64");
     MAKE_PREFILL(gemm_f16_q8_mma3, @"qwen38_prefill_q8_gemm_f16_mma3");
     MAKE_PREFILL(gemm_f16_q8_mma8w,
                  @"qwen38_prefill_q8_gemm_f16_mma8w");
@@ -1080,10 +1097,20 @@ static Q38PrefillPipelines *prefill_pipelines(
     MAKE_PREFILL(gemm_f32_residual_f32_mma,
                  @"qwen38_prefill_q4_gemm_f32_residual_f32_mma");
     MAKE_PREFILL(gemm_f16_mma2, @"qwen38_prefill_q4_gemm_f16_mma2");
+    MAKE_PREFILL(gemm_f16_mma2w48, @"qwen38_prefill_q4_gemm_f16_mma2w48");
+    MAKE_PREFILL(gemm_f16_mma2w64, @"qwen38_prefill_q4_gemm_f16_mma2w64");
     MAKE_PREFILL(mlp_gate_silu_mma2,
                  @"qwen38_prefill_q4_gate_silu_mma2");
+    MAKE_PREFILL(mlp_gate_silu_mma2w48,
+                 @"qwen38_prefill_q4_gate_silu_mma2w48");
+    MAKE_PREFILL(mlp_gate_silu_mma2w64,
+                 @"qwen38_prefill_q4_gate_silu_mma2w64");
     MAKE_PREFILL(mlp_up_mul_mma2,
                  @"qwen38_prefill_q4_up_mul_mma2");
+    MAKE_PREFILL(mlp_up_mul_mma2w48,
+                 @"qwen38_prefill_q4_up_mul_mma2w48");
+    MAKE_PREFILL(mlp_up_mul_mma2w64,
+                 @"qwen38_prefill_q4_up_mul_mma2w64");
     MAKE_PREFILL(convert_x, @"qwen38_prefill_convert_x");
     MAKE_PREFILL(gemm_f16_mma3, @"qwen38_prefill_q4_gemm_f16_mma3");
     MAKE_PREFILL(mlp_gate_up_silu_mma3,
@@ -1098,8 +1125,16 @@ static Q38PrefillPipelines *prefill_pipelines(
                  @"qwen38_prefill_q4_gemm_f32_residual_f32_mma3");
     MAKE_PREFILL(gemm_f32_residual_f16_mma2,
                  @"qwen38_prefill_q4_gemm_f32_residual_f16_mma2");
+    MAKE_PREFILL(gemm_f32_residual_f16_mma2w48,
+                 @"qwen38_prefill_q4_gemm_f32_residual_f16_mma2w48");
+    MAKE_PREFILL(gemm_f32_residual_f16_mma2w64,
+                 @"qwen38_prefill_q4_gemm_f32_residual_f16_mma2w64");
     MAKE_PREFILL(gemm_f32_residual_f32_mma2,
                  @"qwen38_prefill_q4_gemm_f32_residual_f32_mma2");
+    MAKE_PREFILL(gemm_f32_residual_f32_mma2w48,
+                 @"qwen38_prefill_q4_gemm_f32_residual_f32_mma2w48");
+    MAKE_PREFILL(gemm_f32_residual_f32_mma2w64,
+                 @"qwen38_prefill_q4_gemm_f32_residual_f32_mma2w64");
     MAKE_PREFILL(silu_mul, @"qwen38_prefill_silu_mul");
     MAKE_PREFILL(delta_conv, @"qwen38_prefill_delta_conv");
     MAKE_PREFILL(delta_prepare, @"qwen38_prefill_delta_prepare");
@@ -1209,6 +1244,51 @@ static id<MTLBuffer> prefill_buffer(Q38DecodeRuntime *r,
     }
 }
 
+static uint32_t prefill_mma2_tile_rows(Q38DecodeRuntime *r) {
+    return r->prefill_mma_rows == 48 ? 48u :
+           (r->prefill_mma_rows == 64 ? 64u : 32u);
+}
+
+static id<MTLComputePipelineState> prefill_mma2_plain_pipeline(
+    Q38DecodeRuntime *r, Q38PrefillPipelines *p) {
+    return r->prefill_mma_rows == 48 ? p->gemm_f16_mma2w48 :
+           (r->prefill_mma_rows == 64 ? p->gemm_f16_mma2w64 :
+                                        p->gemm_f16_mma2);
+}
+
+static id<MTLComputePipelineState> prefill_mma2_residual_pipeline(
+    Q38DecodeRuntime *r, Q38PrefillPipelines *p, BOOL residual_is_half) {
+    if (r->prefill_mma_rows == 48)
+        return residual_is_half ? p->gemm_f32_residual_f16_mma2w48 :
+                                  p->gemm_f32_residual_f32_mma2w48;
+    if (r->prefill_mma_rows == 64)
+        return residual_is_half ? p->gemm_f32_residual_f16_mma2w64 :
+                                  p->gemm_f32_residual_f32_mma2w64;
+    return residual_is_half ? p->gemm_f32_residual_f16_mma2 :
+                              p->gemm_f32_residual_f32_mma2;
+}
+
+static id<MTLComputePipelineState> prefill_mma2_q8_pipeline(
+    Q38DecodeRuntime *r, Q38PrefillPipelines *p) {
+    return r->prefill_mma_rows == 48 ? p->gemm_f16_q8_mma2w48 :
+           (r->prefill_mma_rows == 64 ? p->gemm_f16_q8_mma2w64 :
+                                        p->gemm_f16_q8_mma2);
+}
+
+static id<MTLComputePipelineState> prefill_mma2_gate_pipeline(
+    Q38DecodeRuntime *r, Q38PrefillPipelines *p) {
+    return r->prefill_mma_rows == 48 ? p->mlp_gate_silu_mma2w48 :
+           (r->prefill_mma_rows == 64 ? p->mlp_gate_silu_mma2w64 :
+                                        p->mlp_gate_silu_mma2);
+}
+
+static id<MTLComputePipelineState> prefill_mma2_up_pipeline(
+    Q38DecodeRuntime *r, Q38PrefillPipelines *p) {
+    return r->prefill_mma_rows == 48 ? p->mlp_up_mul_mma2w48 :
+           (r->prefill_mma_rows == 64 ? p->mlp_up_mul_mma2w64 :
+                                        p->mlp_up_mul_mma2);
+}
+
 static void encode_prefill_gemm_f16(
     Q38DecodeRuntime *r, Q38PrefillPipelines *p,
     id<MTLComputeCommandEncoder> encoder,
@@ -1232,10 +1312,11 @@ static void encode_prefill_gemm_f16(
         return;
     }
     int wide = use_mma && r->prefill_mma_level >= 3;
+    int mma2 = use_mma && r->prefill_mma_level == 2;
     [encoder setComputePipelineState:
         wide ? p->gemm_f16_mma3 :
-        (use_mma ? (r->prefill_mma_level >= 2 ?
-                    p->gemm_f16_mma2 : p->gemm_f16_mma) : p->gemm_f16)];
+        (mma2 ? prefill_mma2_plain_pipeline(r, p) :
+         (use_mma ? p->gemm_f16_mma : p->gemm_f16))];
     [encoder setBuffer:x offset:0 atIndex:0];
     [encoder setBuffer:quants offset:0 atIndex:1];
     [encoder setBuffer:metadata offset:0 atIndex:2];
@@ -1245,7 +1326,13 @@ static void encode_prefill_gemm_f16(
         [encoder dispatchThreadgroups:
             MTLSizeMake((rows + 63) / 64, (p->batch + 31) / 32, 1)
                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-    else if (use_mma)
+    else if (mma2) {
+        uint32_t tile_rows = prefill_mma2_tile_rows(r);
+        [encoder dispatchThreadgroups:
+            MTLSizeMake((rows + tile_rows - 1) / tile_rows,
+                        (p->batch + 31) / 32, 1)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    } else if (use_mma)
         [encoder dispatchThreadgroups:
             MTLSizeMake(rows / 32, (p->batch + 31) / 32, 1)
                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
@@ -1287,17 +1374,18 @@ static void encode_prefill_gemm_residual(
     }
     int wide = use_mma && r->prefill_mma_level >= 3;
     id<MTLComputePipelineState> pipeline;
+    int mma2 = use_mma && r->prefill_mma_level == 2;
     if (wide)
         pipeline = residual_is_half ?
             p->gemm_f32_residual_f16_mma3 : p->gemm_f32_residual_f32_mma3;
+    else if (mma2)
+        pipeline = prefill_mma2_residual_pipeline(r, p, residual_is_half);
     else if (residual_is_half)
         pipeline = !use_mma ? p->gemm_f32_residual_f16 :
-            (r->prefill_mma_level >= 2 ?
-             p->gemm_f32_residual_f16_mma2 : p->gemm_f32_residual_f16_mma);
+                              p->gemm_f32_residual_f16_mma;
     else
         pipeline = !use_mma ? p->gemm_f32_residual_f32 :
-            (r->prefill_mma_level >= 2 ?
-             p->gemm_f32_residual_f32_mma2 : p->gemm_f32_residual_f32_mma);
+                              p->gemm_f32_residual_f32_mma;
     if (use_mma && r->prefill_mma_level >= 2) {
         uint32_t columns = groups_per_row * 64;
         id<MTLBuffer> x_half = prefill_buffer(r, p, 20);
@@ -1320,7 +1408,13 @@ static void encode_prefill_gemm_residual(
         [encoder dispatchThreadgroups:
             MTLSizeMake((rows + 63) / 64, (p->batch + 31) / 32, 1)
                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-    else if (use_mma)
+    else if (mma2) {
+        uint32_t tile_rows = prefill_mma2_tile_rows(r);
+        [encoder dispatchThreadgroups:
+            MTLSizeMake((rows + tile_rows - 1) / tile_rows,
+                        (p->batch + 31) / 32, 1)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    } else if (use_mma)
         [encoder dispatchThreadgroups:
             MTLSizeMake(rows / 32, (p->batch + 31) / 32, 1)
                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
@@ -1370,17 +1464,19 @@ static void encode_prefill_mlp(Q38DecodeRuntime *r, Q38PrefillPipelines *p,
         /* M2-friendly partial fusion on the portable 32-row MMA2 tile. */
         q38_prefill_gemm_parameters parameters = {17408, 80};
 
-        [encoder setComputePipelineState:p->mlp_gate_silu_mma2];
+        [encoder setComputePipelineState:prefill_mma2_gate_pipeline(r, p)];
         [encoder setBuffer:post offset:0 atIndex:0];
         [encoder setBuffer:layer->gate_quants offset:0 atIndex:1];
         [encoder setBuffer:layer->gate_metadata offset:0 atIndex:2];
         [encoder setBuffer:prefill_buffer(r, p, 16) offset:0 atIndex:3];
         [encoder setBytes:&parameters length:sizeof(parameters) atIndex:4];
         [encoder dispatchThreadgroups:
-            MTLSizeMake(17408 / 32, (p->batch + 31) / 32, 1)
+            MTLSizeMake((17408 + prefill_mma2_tile_rows(r) - 1) /
+                        prefill_mma2_tile_rows(r),
+                        (p->batch + 31) / 32, 1)
                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
 
-        [encoder setComputePipelineState:p->mlp_up_mul_mma2];
+        [encoder setComputePipelineState:prefill_mma2_up_pipeline(r, p)];
         [encoder setBuffer:post offset:0 atIndex:0];
         [encoder setBuffer:layer->up_quants offset:0 atIndex:1];
         [encoder setBuffer:layer->up_metadata offset:0 atIndex:2];
@@ -1388,7 +1484,9 @@ static void encode_prefill_mlp(Q38DecodeRuntime *r, Q38PrefillPipelines *p,
         [encoder setBuffer:prefill_buffer(r, p, 18) offset:0 atIndex:4];
         [encoder setBytes:&parameters length:sizeof(parameters) atIndex:5];
         [encoder dispatchThreadgroups:
-            MTLSizeMake(17408 / 32, (p->batch + 31) / 32, 1)
+            MTLSizeMake((17408 + prefill_mma2_tile_rows(r) - 1) /
+                        prefill_mma2_tile_rows(r),
+                        (p->batch + 31) / 32, 1)
                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     } else if (fused_mode == 1 && large_mma3) {
         /* Full gate+up fusion. Kept for A/B; mode 1 was slower on M3 Pro. */
@@ -1557,15 +1655,18 @@ static void encode_prefill_delta(Q38DecodeRuntime *r,
                 MTLSizeMake((16480 + 63) / 64, (p->batch + 31) / 32, 1)
                     threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         } else if (use_mma && r->prefill_mma_level == 2) {
-            /* Half MMA (32 rows x 32 batch): the Q4 mma2 shape. */
-            [*encoder setComputePipelineState:p->gemm_f16_q8_mma2];
+            /* Portable half-input / FP32-accumulator MMA2. The row tile is
+             * selected by QWEN38_PREFILL_MMA_ROWS (32/48/64). */
+            [*encoder setComputePipelineState:prefill_mma2_q8_pipeline(r, p)];
             [*encoder setBuffer:normalized offset:0 atIndex:0];
             [*encoder setBuffer:layer->input_quants offset:0 atIndex:1];
             [*encoder setBuffer:layer->input_metadata offset:0 atIndex:2];
             [*encoder setBuffer:projected offset:0 atIndex:3];
             [*encoder setBytes:&parameters length:sizeof(parameters) atIndex:4];
+            uint32_t tile_rows = prefill_mma2_tile_rows(r);
             [*encoder dispatchThreadgroups:
-                MTLSizeMake(16480 / 32, (p->batch + 31) / 32, 1)
+                MTLSizeMake((16480 + tile_rows - 1) / tile_rows,
+                            (p->batch + 31) / 32, 1)
                     threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         } else if (!use_mma && r->fast_verify && r->prefill_mma_level > 0 &&
                    p->batch >= 3 && p->batch <= 8 && r->wide_verify) {
@@ -2318,6 +2419,8 @@ static void request_weight_residency(Q38DecodeRuntime *r) {
     }
 }
 
+static void refresh_prefill_tuning(Q38DecodeRuntime *r);
+
 qwen38_m3_model *qwen38_m3_model_open(
     const char *model_directory, const char *metallib_path,
     uint32_t context_capacity, char *error_message,
@@ -2391,6 +2494,16 @@ qwen38_m3_model *qwen38_m3_model_open(
                 r->flash_qk_reuse, r->kv_q8, prefill_fused_mlp_mode());
         r->layers = [NSMutableArray arrayWithCapacity:64];
         r->device = MTLCreateSystemDefaultDevice();
+        if (r->device != nil) {
+            refresh_prefill_tuning(r);
+            fprintf(stderr,
+                    "qwen38: gpu=\"%s\" prefill_mma=%d "
+                    "prefill_mma_rows=%d%s\n",
+                    r->device.name.UTF8String, r->prefill_mma_level,
+                    r->prefill_mma_rows,
+                    r->prefill_mma_level == 2 ? "" :
+                    " (rows applies when MMA=2)");
+        }
         NSError *metal_error = nil;
         NSURL *url = [NSURL fileURLWithPath:
             [NSString stringWithUTF8String:metallib_path]];
@@ -4565,6 +4678,37 @@ static void prefill_progress(uint32_t done, uint32_t total, double begin) {
     fflush(stderr);
 }
 
+static void refresh_prefill_tuning(Q38DecodeRuntime *r) {
+    const char *mma_env = getenv("QWEN38_PREFILL_MMA");
+    if (mma_env != NULL && mma_env[0] != '\0') {
+        r->prefill_mma_level = atoi(mma_env);
+    } else if ([r->device supportsFamily:MTLGPUFamilyApple9]) {
+        /* M3/M4 and newer compatible Apple9 devices: measured MMA3 default. */
+        r->prefill_mma_level = 3;
+    } else if ([r->device supportsFamily:MTLGPUFamilyApple8]) {
+        /* M2 family: portable half-input / FP32-accumulator MMA2. */
+        r->prefill_mma_level = 2;
+    } else {
+        /* Conservative fallback for older/unvalidated Apple GPU families. */
+        r->prefill_mma_level = 1;
+    }
+    if (r->prefill_mma_level < 0) r->prefill_mma_level = 0;
+    if (r->prefill_mma_level > 3) r->prefill_mma_level = 3;
+
+    int default_rows = [r->device supportsFamily:MTLGPUFamilyApple9] ? 64 : 32;
+    const char *rows_env = getenv("QWEN38_PREFILL_MMA_ROWS");
+    int rows = rows_env != NULL && rows_env[0] != '\0' ? atoi(rows_env) :
+                                                          default_rows;
+    if (rows != 32 && rows != 48 && rows != 64) {
+        fprintf(stderr,
+                "qwen38: ignoring QWEN38_PREFILL_MMA_ROWS=%s "
+                "(expected 32, 48 or 64); using %d\n",
+                rows_env != NULL ? rows_env : "", default_rows);
+        rows = default_rows;
+    }
+    r->prefill_mma_rows = rows;
+}
+
 int qwen38_m3_model_prefill(
     qwen38_m3_model *model, const uint32_t *token_ids,
     uint32_t token_count, uint32_t start_position,
@@ -4596,8 +4740,7 @@ int qwen38_m3_model_prefill(
     }
     memset(result, 0, sizeof(*result));
     result->token_count = token_count;
-    const char *mma_env = getenv("QWEN38_PREFILL_MMA");
-    r->prefill_mma_level = mma_env == NULL ? 3 : atoi(mma_env);
+    refresh_prefill_tuning(r);
     double begin = decode_seconds();
     const char *max_chunk_env = getenv("QWEN38_PREFILL_MAX_CHUNK");
     /* The S64/S128/S512 buckets run only on the half-tile GEMM levels:

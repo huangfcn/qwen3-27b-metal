@@ -120,15 +120,21 @@ int main(int argc, char **argv) {
         uint32_t sequence[192];
         for (uint32_t index = 0; index < count; ++index)
             sequence[index] = kTokens[index % 36];
-        /* Keep MMA2 at both a 32-token control and the production 128-token
-         * trunk. This separates half-MMA correctness from large-bucket
-         * scheduling and catches Apple8/M2-specific failures directly. */
-        static const char *mode_names[4] = {
-            "exact", "mma1", "mma2-32", "mma2-128"};
-        static const char *mode_env[4] = {"0", "1", "2", "2"};
-        static const char *chunk_env[4] = {"32", "32", "32", "128"};
-        for (unsigned mode = 0; mode < 4; ++mode) {
+        /* Exercise the portable MMA2 tile widths independently. 32 is the
+         * M2-safe baseline; 48/64 are experimental wider FP32-accumulator
+         * tiles. MMA3 remains the M3 production control. */
+        static const char *mode_names[7] = {
+            "exact", "mma1", "mma2-r32-c32", "mma2-r32",
+            "mma2-r48", "mma2-r64", "mma3"};
+        static const char *mode_env[7] = {
+            "0", "1", "2", "2", "2", "2", "3"};
+        static const char *rows_env[7] = {
+            "32", "32", "32", "32", "48", "64", "64"};
+        static const char *chunk_env[7] = {
+            "32", "32", "32", "128", "128", "128", "128"};
+        for (unsigned mode = 0; mode < 7; ++mode) {
             setenv("QWEN38_PREFILL_MMA", mode_env[mode], 1);
+            setenv("QWEN38_PREFILL_MMA_ROWS", rows_env[mode], 1);
             setenv("QWEN38_PREFILL_MAX_CHUNK", chunk_env[mode], 1);
             qwen38_m3_model_reset(model);
             qwen38_m3_prefill_result prefill;
