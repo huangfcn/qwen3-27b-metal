@@ -166,40 +166,80 @@ def render_template(messages, thinking=False, effort="xhigh", tools=None):
 
 
 class ThinkSplitter:
-    """Split a streamed reply into reasoning and answer. In thinking
-    mode the generation begins inside the think block; everything before
-    '</think>' is reasoning_content, everything after (minus the
-    separating blank line) is content. Holds back a possible partial tag
-    at a delta boundary."""
+    """Split a streamed reply into reasoning and answer.
 
-    def __init__(self, active):
+    In thinking mode the normal boundary is ``</think>``.  Tool-using local
+    models occasionally start ``<tool_call>`` before emitting that close tag;
+    when tools are available, treat the tool marker as an implicit end of
+    reasoning instead of leaking tool XML as reasoning and losing the call.
+
+    Alternate-agent ``<invoke>`` wrappers are protocol noise.  While tools are
+    active they are suppressed, including when split across stream deltas.
+    """
+
+    _NOISE_MARKERS = ("<invoke>", "</invoke>")
+
+    def __init__(self, active, tool_boundary=False):
         self.active = active
+        self.tool_boundary = bool(tool_boundary)
         self.buffer = ""
         self.done = not active
+        self.implicit_tool_boundary = False
+
+    @staticmethod
+    def _partial_suffix(buffer, markers):
+        keep = 0
+        for marker in markers:
+            for probe in range(min(len(marker) - 1, len(buffer)), 0, -1):
+                if marker.startswith(buffer[-probe:]):
+                    keep = max(keep, probe)
+                    break
+        return keep
+
+    def _drop_complete_noise(self):
+        if not self.tool_boundary:
+            return
+        for marker in self._NOISE_MARKERS:
+            self.buffer = self.buffer.replace(marker, "")
 
     def feed(self, text):
         if self.done:
             return ("", text) if self.active else (None, text)
         self.buffer += text
-        marker = self.buffer.find("</think>")
-        if marker >= 0:
-            reasoning = self.buffer[:marker]
-            rest = self.buffer[marker + len("</think>"):]
-            rest = rest.lstrip("\n")
+        self._drop_complete_noise()
+
+        think_marker = self.buffer.find("</think>")
+        tool_marker = self.buffer.find(TOOL_CALL_OPEN) \
+            if self.tool_boundary else -1
+
+        # Whichever boundary appears first wins. A tool call before </think>
+        # is malformed template output, but is unambiguous when tools exist.
+        if tool_marker >= 0 and \
+                (think_marker < 0 or tool_marker < think_marker):
+            reasoning = self.buffer[:tool_marker].rstrip()
+            rest = self.buffer[tool_marker:]
+            self.buffer = ""
+            self.done = True
+            self.implicit_tool_boundary = True
+            return (reasoning, rest)
+
+        if think_marker >= 0:
+            reasoning = self.buffer[:think_marker]
+            rest = self.buffer[think_marker + len("</think>"):].lstrip("\n")
             self.buffer = ""
             self.done = True
             return (reasoning, rest)
-        # hold back a suffix that could start the closing tag
-        keep = 0
-        for probe in range(min(len("</think>") - 1, len(self.buffer)), 0, -1):
-            if "</think>".startswith(self.buffer[-probe:]):
-                keep = probe
-                break
+
+        markers = ["</think>"]
+        if self.tool_boundary:
+            markers.extend((TOOL_CALL_OPEN, *self._NOISE_MARKERS))
+        keep = self._partial_suffix(self.buffer, markers)
         emit = self.buffer[:len(self.buffer) - keep]
         self.buffer = self.buffer[len(self.buffer) - keep:]
         return (emit, "")
 
     def flush(self):
+        self._drop_complete_noise()
         rest = self.buffer
         self.buffer = ""
         return rest
@@ -234,10 +274,36 @@ TOOL_CALL_FORMAT = (
 )
 
 TOOL_CALL_OPEN = "<tool_call>"
+TOOL_CALL_CLOSE = "</tool_call>"
 TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.S)
 FUNCTION_RE = re.compile(r"<function=([^>\s]*)>\s*(.*?)\s*</function>", re.S)
 PARAMETER_RE = re.compile(r"<parameter=([^>\s]*)>\n?(.*?)\n?</parameter>",
                           re.S)
+INVOKE_WRAPPER_RE = re.compile(r"</?invoke>\s*", re.I)
+
+
+def strip_tool_wrapper_noise(text):
+    """Suppress alternate-agent invoke wrappers in tool parsing paths."""
+    return INVOKE_WRAPPER_RE.sub("", text).rstrip()
+
+
+def split_finished_reply(text, thinking, tools_expected=False):
+    """Split a completed generation into reasoning and visible/tool content.
+
+    When tools are present, ``<tool_call>`` before ``</think>`` is accepted as
+    an implicit end of reasoning.  This mirrors ThinkSplitter's streaming
+    recovery and prevents a malformed thinking close from swallowing a valid
+    structured tool call.
+    """
+    if not thinking:
+        return None, text
+    think_marker = text.find("</think>")
+    tool_marker = text.find(TOOL_CALL_OPEN) if tools_expected else -1
+    if tool_marker >= 0 and (think_marker < 0 or tool_marker < think_marker):
+        return strip_tool_wrapper_noise(text[:tool_marker]), text[tool_marker:]
+    if think_marker >= 0:
+        return text[:think_marker], text[think_marker + len("</think>"):].lstrip("\n")
+    return text, ""
 
 
 def flatten_tools(tools):
@@ -509,30 +575,66 @@ def coerce_argument(text, schema):
         return text
 
 
+def _tool_call_blocks(text):
+    """Yield tool-call bodies, tolerating a missing outer </tool_call>.
+
+    A complete </function> is still required, so recovery never guesses where
+    an argument ends.
+    """
+    starts = [match.start() for match in
+              re.finditer(re.escape(TOOL_CALL_OPEN), text)]
+    for index, start in enumerate(starts):
+        body_start = start + len(TOOL_CALL_OPEN)
+        next_start = starts[index + 1] if index + 1 < len(starts) else len(text)
+        close = text.find(TOOL_CALL_CLOSE, body_start, next_start)
+        body_end = close if close >= 0 else next_start
+        yield text[body_start:body_end]
+
+
+def _resolve_tool(name, table):
+    """Resolve an exact tool name, or a unique bare name in a namespace."""
+    if name in table:
+        return name, table[name]
+    matches = [(qualified, value) for qualified, value in table.items()
+               if qualified.rsplit(".", 1)[-1] == name]
+    if len(matches) == 1:
+        return matches[0]
+    return None, (None, {})
+
+
 def parse_tool_calls(text, table):
-    """Extract <tool_call> blocks, returning (leading text, calls)."""
+    """Extract Qwen <tool_call> blocks, returning (leading text, calls).
+
+    Multiple sibling calls are supported. Unknown tool names are ignored.
+    A missing outer </tool_call> is recoverable when </function> is complete.
+    """
     calls = []
-    for block in TOOL_CALL_RE.findall(text):
+    for block in _tool_call_blocks(text):
         for name, body in FUNCTION_RE.findall(block):
-            namespace, schema = table.get(name, (None, {}))
+            qualified, resolved = _resolve_tool(name, table)
+            if qualified is None:
+                continue
+            namespace, schema = resolved
             properties = (schema.get("parameters") or {}).get("properties") \
                 or {}
             arguments = {}
             for key, value in PARAMETER_RE.findall(body):
                 arguments[key] = coerce_argument(value, properties.get(key))
-            bare = name.split(".", 1)[1] if namespace and "." in name else name
+            bare = qualified.split(".", 1)[1] \
+                if namespace and "." in qualified else qualified
             calls.append({"name": bare, "namespace": namespace,
                           "arguments": json.dumps(arguments)})
     marker = text.find(TOOL_CALL_OPEN)
     leading = text if marker < 0 else text[:marker]
-    return leading.strip(), calls
+    return strip_tool_wrapper_noise(leading).strip(), calls
 
 
 class ToolCallSplitter:
-    """Stream text until a tool call starts. The template forbids any
-    suffix after a call, so once <tool_call> appears nothing more is
-    surfaced as assistant text; a partial opening tag is held back at a
-    delta boundary."""
+    """Stream text until a tool call starts.
+
+    Once <tool_call> appears nothing more is surfaced as assistant text.
+    Alternate <invoke> wrappers are suppressed while tools are active.
+    """
 
     def __init__(self):
         self.buffer = ""
@@ -544,7 +646,7 @@ class ToolCallSplitter:
         self.buffer += text
         marker = self.buffer.find(TOOL_CALL_OPEN)
         if marker >= 0:
-            emit = self.buffer[:marker]
+            emit = strip_tool_wrapper_noise(self.buffer[:marker])
             self.buffer = ""
             self.stopped = True
             return emit
@@ -976,10 +1078,7 @@ class Handler(BaseHTTPRequestHandler):
                                       "type": "server_error"}}, 500)
             return
         text = "".join(chunks)
-        if thinking:
-            marker = text.find("</think>")
-            if marker >= 0:
-                text = text[marker + len("</think>"):].lstrip("\n")
+        _, text = split_finished_reply(text, thinking, bool(table))
         output = self.responses_output(text, table, identifier)
         self.send_json(self.responses_envelope(identifier, created,
                                                "completed", output, stats))
@@ -991,7 +1090,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.sse_event("response.created", {"response":
                 self.responses_envelope(identifier, created, "in_progress")})
-            think = ThinkSplitter(thinking)
+            think = ThinkSplitter(thinking, tool_boundary=bool(table))
             splitter = ToolCallSplitter()
             answer = []
             opened = [False]
@@ -1028,6 +1127,9 @@ class Handler(BaseHTTPRequestHandler):
                                        f"{identifier}.prefix"), "w") as f:
                     f.write(prefix or "")
             stats = ENGINE.generate(rendered, deliver, sampling, prefix)
+            if think.implicit_tool_boundary:
+                print("tool_parse: recovered tool call before </think> "
+                      "(responses)", flush=True)
             tail = think.flush()
             if tail and think.done:
                 answer.append(tail)
@@ -1084,16 +1186,10 @@ class Handler(BaseHTTPRequestHandler):
                                       "type": "server_error"}}, 500)
             return
         text = "".join(chunks)
-        message = {"role": "assistant", "content": text}
+        reasoning, content = split_finished_reply(text, thinking, bool(table))
+        message = {"role": "assistant", "content": content}
         if thinking:
-            marker = text.find("</think>")
-            if marker >= 0:
-                message["reasoning_content"] = text[:marker]
-                message["content"] = text[marker + len("</think>"):] \
-                    .lstrip("\n")
-            else:
-                message["reasoning_content"] = text
-                message["content"] = ""
+            message["reasoning_content"] = reasoning or ""
         finish = stats.get("stop", "stop")
         if table:
             leading, _ = parse_tool_calls(message["content"], table)
@@ -1148,7 +1244,7 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             event(chunk({"role": "assistant", "content": ""}))
-            splitter = ThinkSplitter(thinking)
+            splitter = ThinkSplitter(thinking, tool_boundary=bool(table))
             # A tool call must not reach the client as assistant text, so
             # the visible stream stops at <tool_call> and the parsed call
             # goes out as one tool_calls delta at the end.
@@ -1169,6 +1265,9 @@ class Handler(BaseHTTPRequestHandler):
                     emit(content)
 
             stats = ENGINE.generate(rendered, deliver, sampling, prefix)
+            if splitter.implicit_tool_boundary:
+                print("tool_parse: recovered tool call before </think> "
+                      "(chat)", flush=True)
             tail = splitter.flush()
             if tail:
                 if splitter.done:
