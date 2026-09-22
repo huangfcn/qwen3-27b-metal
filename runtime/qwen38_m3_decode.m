@@ -85,6 +85,8 @@ enum {
     id<MTLComputePipelineState> gemm_f32_residual_f16_mma;
     id<MTLComputePipelineState> gemm_f32_residual_f32_mma;
     id<MTLComputePipelineState> gemm_f16_mma2;
+    id<MTLComputePipelineState> mlp_gate_silu_mma2;
+    id<MTLComputePipelineState> mlp_up_mul_mma2;
     id<MTLComputePipelineState> gemm_f16_mma3;
     id<MTLComputePipelineState> mlp_gate_up_silu_mma3;
     id<MTLComputePipelineState> mlp_gate_silu_mma3;
@@ -1078,6 +1080,10 @@ static Q38PrefillPipelines *prefill_pipelines(
     MAKE_PREFILL(gemm_f32_residual_f32_mma,
                  @"qwen38_prefill_q4_gemm_f32_residual_f32_mma");
     MAKE_PREFILL(gemm_f16_mma2, @"qwen38_prefill_q4_gemm_f16_mma2");
+    MAKE_PREFILL(mlp_gate_silu_mma2,
+                 @"qwen38_prefill_q4_gate_silu_mma2");
+    MAKE_PREFILL(mlp_up_mul_mma2,
+                 @"qwen38_prefill_q4_up_mul_mma2");
     MAKE_PREFILL(convert_x, @"qwen38_prefill_convert_x");
     MAKE_PREFILL(gemm_f16_mma3, @"qwen38_prefill_q4_gemm_f16_mma3");
     MAKE_PREFILL(mlp_gate_up_silu_mma3,
@@ -1356,9 +1362,35 @@ static void encode_prefill_mlp(Q38DecodeRuntime *r, Q38PrefillPipelines *p,
                                Q38DecodeLayer *layer) {
     id<MTLBuffer> post = prefill_buffer(r, p, 15);
     int fused_mode = prefill_fused_mlp_mode();
+    int large_mma2 = r->prefill_mma_level == 2 &&
+                     (int)p->batch >= r->mma_min_batch;
     int large_mma3 = r->prefill_mma_level >= 3 &&
                      (int)p->batch >= r->mma_min_batch;
-    if (fused_mode == 1 && large_mma3) {
+    if (fused_mode == 2 && large_mma2) {
+        /* M2-friendly partial fusion on the portable 32-row MMA2 tile. */
+        q38_prefill_gemm_parameters parameters = {17408, 80};
+
+        [encoder setComputePipelineState:p->mlp_gate_silu_mma2];
+        [encoder setBuffer:post offset:0 atIndex:0];
+        [encoder setBuffer:layer->gate_quants offset:0 atIndex:1];
+        [encoder setBuffer:layer->gate_metadata offset:0 atIndex:2];
+        [encoder setBuffer:prefill_buffer(r, p, 16) offset:0 atIndex:3];
+        [encoder setBytes:&parameters length:sizeof(parameters) atIndex:4];
+        [encoder dispatchThreadgroups:
+            MTLSizeMake(17408 / 32, (p->batch + 31) / 32, 1)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+        [encoder setComputePipelineState:p->mlp_up_mul_mma2];
+        [encoder setBuffer:post offset:0 atIndex:0];
+        [encoder setBuffer:layer->up_quants offset:0 atIndex:1];
+        [encoder setBuffer:layer->up_metadata offset:0 atIndex:2];
+        [encoder setBuffer:prefill_buffer(r, p, 16) offset:0 atIndex:3];
+        [encoder setBuffer:prefill_buffer(r, p, 18) offset:0 atIndex:4];
+        [encoder setBytes:&parameters length:sizeof(parameters) atIndex:5];
+        [encoder dispatchThreadgroups:
+            MTLSizeMake(17408 / 32, (p->batch + 31) / 32, 1)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    } else if (fused_mode == 1 && large_mma3) {
         /* Full gate+up fusion. Kept for A/B; mode 1 was slower on M3 Pro. */
         q38_prefill_gemm_parameters parameters = {17408, 80};
         [encoder setComputePipelineState:p->mlp_gate_up_silu_mma3];

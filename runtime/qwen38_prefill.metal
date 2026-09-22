@@ -2368,6 +2368,40 @@ kernel void qwen38_prefill_q4_gemm_f16_mma2(
 #undef STORE_PLAIN2
 }
 
+/* M2/Apple8 partial MLP fusion for the portable MMA2 path.  This mirrors
+ * the proven MMA3 fusion but keeps the 32-row tile and FP32 accumulator
+ * that make MMA2 reliable on M2.  Gate writes SiLU(gate); up consumes that
+ * plane and writes SiLU(gate) * up, removing the raw-up plane and the
+ * standalone elementwise kernel. */
+kernel void qwen38_prefill_q4_gate_silu_mma2(
+    device const half *x [[buffer(0)]],
+    device const uchar *quants [[buffer(1)]],
+    device const Q4PrefillMeta *metadata [[buffer(2)]],
+    device float *output [[buffer(3)]],
+    constant PrefillGemmParams &p [[buffer(4)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint simdgroup_index [[simdgroup_index_in_threadgroup]],
+    uint3 group_id [[threadgroup_position_in_grid]]) {
+#define STORE_GATE_SILU2 output[out_index] = value / (1.0f + exp(-value))
+    QWEN38_PREFILL_GEMM_MMA2_BODY(STORE_GATE_SILU2)
+#undef STORE_GATE_SILU2
+}
+
+kernel void qwen38_prefill_q4_up_mul_mma2(
+    device const half *x [[buffer(0)]],
+    device const uchar *quants [[buffer(1)]],
+    device const Q4PrefillMeta *metadata [[buffer(2)]],
+    device const float *gate_silu [[buffer(3)]],
+    device float *output [[buffer(4)]],
+    constant PrefillGemmParams &p [[buffer(5)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint simdgroup_index [[simdgroup_index_in_threadgroup]],
+    uint3 group_id [[threadgroup_position_in_grid]]) {
+#define STORE_UP_MUL2 output[out_index] = value * gate_silu[out_index]
+    QWEN38_PREFILL_GEMM_MMA2_BODY(STORE_UP_MUL2)
+#undef STORE_UP_MUL2
+}
+
 kernel void qwen38_prefill_q4_gemm_f32_residual_f16_mma2(
     device const half *x [[buffer(0)]],
     device const uchar *quants [[buffer(1)]],
