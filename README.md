@@ -15,18 +15,13 @@ This project grew out of [`baryhuang/llm-in-c`](https://github.com/baryhuang/llm
 
 ## Hardware support
 
-One Metal runtime serves every chip. Chip-specific behavior (chunk sizes,
-memory limits, weight-pinning policy, context limits) is configured per chip;
-a separate kernel is added only when measurements demonstrate a chip needs
-one.
+One Metal runtime serves every supported chip, with chip-specific prefill defaults selected automatically at runtime.
 
 | Chip | Status |
 |---|---|
-| Apple M3 Pro (11-core CPU, 14-core GPU, 36 GB) | extensively tested |
-| Apple M2 / M2 Pro / M2 Max | compatible — same unified-memory Metal 3 runtime, testing needed |
-| Apple M3 / M3 Max | compatible — same runtime, testing needed |
-| Apple M4 / M4 Pro / M4 Max | compatible — same runtime, testing needed |
-| Apple M5 | compatible — same runtime, testing needed |
+| Apple M2 Pro | supported and tested |
+| Apple M3 Pro | supported and extensively tested |
+| Apple M4 Pro | supported |
 
 ## Target and artifact (M3 Pro record)
 
