@@ -323,8 +323,8 @@ enum {
     size_t state_bytes;
     size_t kv_bytes;
     int prefill_mma_level;
-    /* Output-row tile for the portable MMA2 path. 32 is the validated M2
-     * baseline; 48/64 are experimental wider FP32-accumulator tiles. */
+    /* Output-row tile for the portable MMA2 path. 32/48/64 remain
+     * selectable for benchmarking; 64 is the validated M2/M3 winner. */
     int prefill_mma_rows;
     /* Smallest batch routed to the simdgroup-matrix GEMM kernels. Those
      * kernels pay for a full 32-row batch tile regardless of the real
@@ -1461,7 +1461,7 @@ static void encode_prefill_mlp(Q38DecodeRuntime *r, Q38PrefillPipelines *p,
     int large_mma3 = r->prefill_mma_level >= 3 &&
                      (int)p->batch >= r->mma_min_batch;
     if (fused_mode == 2 && large_mma2) {
-        /* M2-friendly partial fusion on the portable 32-row MMA2 tile. */
+        /* Partial fusion on the selected portable MMA2 row tile. */
         q38_prefill_gemm_parameters parameters = {17408, 80};
 
         [encoder setComputePipelineState:prefill_mma2_gate_pipeline(r, p)];
@@ -2496,11 +2496,27 @@ qwen38_m3_model *qwen38_m3_model_open(
         r->device = MTLCreateSystemDefaultDevice();
         if (r->device != nil) {
             refresh_prefill_tuning(r);
+            /* MTLGPUFamilyApple10 == 1010 in current Metal headers. Use the
+             * numeric value here so the source still builds with older SDKs
+             * that predate the Apple10 enum name. */
+            const MTLGPUFamily q38_apple10 = (MTLGPUFamily)1010;
+            const char *gpu_family =
+                [r->device supportsFamily:q38_apple10] ? "apple10" :
+                ([r->device supportsFamily:MTLGPUFamilyApple9] ? "apple9" :
+                 ([r->device supportsFamily:MTLGPUFamilyApple8] ? "apple8" :
+                  "older"));
+            const char *mma_source =
+                (getenv("QWEN38_PREFILL_MMA") != NULL &&
+                 getenv("QWEN38_PREFILL_MMA")[0] != '\0') ? "env" : "auto";
+            const char *rows_source =
+                (getenv("QWEN38_PREFILL_MMA_ROWS") != NULL &&
+                 getenv("QWEN38_PREFILL_MMA_ROWS")[0] != '\0') ? "env" : "auto";
             fprintf(stderr,
-                    "qwen38: gpu=\"%s\" prefill_mma=%d "
-                    "prefill_mma_rows=%d%s\n",
-                    r->device.name.UTF8String, r->prefill_mma_level,
-                    r->prefill_mma_rows,
+                    "qwen38: gpu=\"%s\" family=%s prefill_mma=%d(%s) "
+                    "prefill_mma_rows=%d(%s)%s\n",
+                    r->device.name.UTF8String, gpu_family,
+                    r->prefill_mma_level, mma_source,
+                    r->prefill_mma_rows, rows_source,
                     r->prefill_mma_level == 2 ? "" :
                     " (rows applies when MMA=2)");
         }
@@ -4679,23 +4695,42 @@ static void prefill_progress(uint32_t done, uint32_t total, double begin) {
 }
 
 static void refresh_prefill_tuning(Q38DecodeRuntime *r) {
+    /* Current Apple-silicon tuning:
+     *   Apple8  (M2)    -> MMA2, 64 rows: half inputs + FP32 accumulator.
+     *   Apple9  (M3/M4) -> MMA3, 64 rows: measured M3 Pro winner.
+     *   Apple10 (M5)    -> MMA3, 64 rows: safe starting default until an
+     *                       M5-specific kernel is shown to win.
+     * Explicit environment settings always win so every path remains
+     * benchmarkable.  Apple10 is 1010 in Metal headers; spelling it as a
+     * numeric MTLGPUFamily keeps this source buildable with older SDKs. */
+    const MTLGPUFamily q38_apple10 = (MTLGPUFamily)1010;
+    BOOL apple10 = [r->device supportsFamily:q38_apple10];
+    BOOL apple9 = [r->device supportsFamily:MTLGPUFamilyApple9];
+    BOOL apple8 = [r->device supportsFamily:MTLGPUFamilyApple8];
+
     const char *mma_env = getenv("QWEN38_PREFILL_MMA");
     if (mma_env != NULL && mma_env[0] != '\0') {
         r->prefill_mma_level = atoi(mma_env);
-    } else if ([r->device supportsFamily:MTLGPUFamilyApple9]) {
-        /* M3/M4 and newer compatible Apple9 devices: measured MMA3 default. */
+    } else if (apple10) {
+        /* M5 class: use the Apple9 winner until M5-specific tuning exists. */
         r->prefill_mma_level = 3;
-    } else if ([r->device supportsFamily:MTLGPUFamilyApple8]) {
-        /* M2 family: portable half-input / FP32-accumulator MMA2. */
+    } else if (apple9) {
+        /* M3/M4 class: measured winner. */
+        r->prefill_mma_level = 3;
+    } else if (apple8) {
+        /* M2 class: validated portable fast path. */
         r->prefill_mma_level = 2;
     } else {
-        /* Conservative fallback for older/unvalidated Apple GPU families. */
+        /* M1/older/unvalidated: keep the float-MMA path. */
         r->prefill_mma_level = 1;
     }
     if (r->prefill_mma_level < 0) r->prefill_mma_level = 0;
     if (r->prefill_mma_level > 3) r->prefill_mma_level = 3;
 
-    int default_rows = [r->device supportsFamily:MTLGPUFamilyApple9] ? 64 : 32;
+    /* 64 rows won the M3 Pro 32/48/64 sweep and was also validated on M2
+     * Pro, where 48 and 64 were close and both beat 32. Keep 32/48 as
+     * explicit benchmarking/debug choices. */
+    int default_rows = (apple10 || apple9 || apple8) ? 64 : 32;
     const char *rows_env = getenv("QWEN38_PREFILL_MMA_ROWS");
     int rows = rows_env != NULL && rows_env[0] != '\0' ? atoi(rows_env) :
                                                           default_rows;
