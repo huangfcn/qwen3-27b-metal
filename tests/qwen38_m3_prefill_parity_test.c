@@ -15,10 +15,10 @@
 
 enum { CAPACITY = 192 };
 
-/* Measured S32 fast-math reassociation drift reaches 0.084 absolute on
- * state values of magnitude ~20 while every next-token decision stays
- * identical; real defects (races, wrong indexing) produce NaNs or O(1)
- * errors. The S16 bucket is bitwise-exact and is asserted as such. */
+/* Measured fast-math / tiled-prefill reassociation drift is small while
+ * next-token decisions remain identical; real defects (races, wrong indexing)
+ * produce NaNs or O(1) errors. Flash attention intentionally changes the
+ * arithmetic order even for S16, so bitwise equality is diagnostic only. */
 /* Absolute floor plus a relative escape: the KV cache stores half, and
  * a single half ulp at key magnitudes in the hundreds is 0.25-0.5, so a
  * flat absolute bound would flag representation noise, not drift. */
@@ -112,9 +112,11 @@ int main(int argc, char **argv) {
         float *reference_logits = malloc(logit_count * sizeof(float));
         memcpy(reference_logits, logits, logit_count * sizeof(float));
 
-        /* Candidates: the decode-identical exact path (QWEN38_PREFILL_MMA=0,
-         * S16-only runs must stay bitwise), the float tiled simdgroup-matrix
-         * path, and the half tiled path (argmax and tolerance gates only). */
+        /* Candidates: scalar/exact-GEMM prefill (QWEN38_PREFILL_MMA=0),
+         * float tiled simdgroup-matrix prefill, and the half tiled path.
+         * With Flash prefill enabled all three may differ bitwise from the
+         * one-token decode graph, so correctness is gated on finite state,
+         * bounded drift, and an identical next-token decision. */
         uint32_t sequence[192];
         for (uint32_t index = 0; index < count; ++index)
             sequence[index] = kTokens[index % 36];
@@ -194,9 +196,7 @@ int main(int argc, char **argv) {
             int drift_gated = count <= 96;
             int pass = nan_count == 0 && existence_mismatch == 0 &&
                        (!drift_gated || max_abs <= tolerance) &&
-                       reference_best == candidate_best &&
-                       (mode >= 1 || prefill.chunk32_count != 0 ||
-                        bitwise);
+                       reference_best == candidate_best;
             printf("check=run%u mode=%s chunks=32x%u/16x%u/1x%u "
                    "bitwise_states=%s bitwise_logits=%s "
                    "state_max_abs=%.9g nan=%u argmax=%u/%u status=%s\n",

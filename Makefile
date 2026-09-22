@@ -220,12 +220,23 @@ test: qwen38-sampler-test qwen38-m3-api-state-test \
 	$(QWEN38_SAMPLER_TEST)
 
 # Live model tests; needs the packed images (see the Run section in README).
+# The main parity gate explicitly exercises the production Flash-prefill path.
+# Bitwise state/logit equality is reported by the test but is not a correctness
+# requirement when Flash attention changes arithmetic order.
 MODEL_DIR ?= models/qwen38-runtime
+PREFILL_PARITY_ENV ?= QWEN38_FLASH_PREFILL=1
 live-test: qwen38-m3-api-state-test qwen38-m3-prefill-parity-test \
 	qwen38-m3-dflash2-test
 	$(QWEN38_M3_API_STATE_TEST) $(MODEL_DIR) $(QWEN38_M3_METALLIB)
-	$(QWEN38_M3_PREFILL_PARITY_TEST) $(MODEL_DIR) $(QWEN38_M3_METALLIB)
+	$(PREFILL_PARITY_ENV) $(QWEN38_M3_PREFILL_PARITY_TEST) $(MODEL_DIR) $(QWEN38_M3_METALLIB)
 	$(QWEN38_M3_DFLASH2_TEST) $(MODEL_DIR) $(QWEN38_M3_METALLIB)
+
+# Optional regression run for the older materialized-score attention path.
+# This uses the same semantic parity gate; it is intentionally separate from
+# live-test because production runs with Flash prefill enabled.
+live-test-prefill-no-flash: qwen38-m3-prefill-parity-test
+	QWEN38_FLASH_PREFILL=0 $(QWEN38_M3_PREFILL_PARITY_TEST) \
+		$(MODEL_DIR) $(QWEN38_M3_METALLIB)
 
 # ---------------------------------------------------------------------------
 # Benchmarks
@@ -314,7 +325,7 @@ qwen38-tools:
 
 .PHONY: all metallib qwen38-m3-chat qwen38-m3-generate qwen38-tools \
 	qwen38-sampler-test qwen38-m3-api-state-test qwen38-m3-prefill-parity-test \
-	qwen38-m3-dflash2-test test live-test benchmarks qwen38-m3-mlp-bench \
+	qwen38-m3-dflash2-test test live-test live-test-prefill-no-flash benchmarks qwen38-m3-mlp-bench \
 	qwen38-m3-deltanet-bench qwen38-m3-layer-bench qwen38-m3-attention-bench clean
 
 clean:
