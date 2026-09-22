@@ -188,6 +188,8 @@ python server/qwen38_serve.py \
         --max-tokens 16384
 ```
 
+**Weight pinning:** keeping model weights resident in memory can slightly improve runtime performance at the cost of higher pinned-memory usage. Set `QWEN38_PIN_WEIGHTS=1` to force pinning, `QWEN38_PIN_WEIGHTS=auto` to enable automatic pinning based on available memory headroom, or `QWEN38_PIN_WEIGHTS=0` to disable it. When unset, weight pinning is disabled by default (equivalent to `0`).
+
 The server serves both `POST /v1/chat/completions` and
 `POST /v1/responses`. It accepts standard sampling fields;
 `reasoning_effort` enables the thinking templates, and streaming responses
