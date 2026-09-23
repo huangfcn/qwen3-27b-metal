@@ -103,6 +103,8 @@ actually create**, rather than maximizing a short-prompt benchmark.
 | [`compiler/`](compiler/) | Pure-Python offline checkpoint inspection, Q4/Q8 quantizers, runtime-image packers and the one-command builder |
 | [`commands/`](commands/) | Chat (`qwen38_m3_chat.c`) and one-shot (`qwen38_m3_generate.c`) front ends |
 | [`server/`](server/) | OpenAI-compatible / Responses server (`qwen38_serve.py`) |
+| [`tests/`](tests/) | Correctness and parity tests for runtime and kernel validation |
+| [`benchmarks/`](benchmarks/) | Performance benchmarks and profiling utilities |
 
 ## Compiled image format
 
@@ -131,8 +133,13 @@ make                  # metallib + chat/generate binaries
 make qwen38-m3-chat   # runtime only
 ```
 
-Generating the model images is pure Python 3 (numpy) — the `compiler/`
-directory has no build step.
+If you do not want to build the project from source, you can use the prebuilt
+binaries by renaming the supplied `bin/` directory to `build/`. The runtime
+scripts expect the compiled artifacts under `build/`:
+
+```sh
+mv bin build
+```
 
 Outputs land in `build/`:
 
@@ -150,7 +157,7 @@ values before writing):
 
 ```sh
 # Prebuilt Q4+Q8 + MTP + DFlash2 images
-huggingface-cli download huangfcn/Qwen3.8-27B-DFlash2-Metal \
+hf download huangfcn/Qwen3.8-27B-DFlash2-Metal \
     --local-dir ./models/qwen38-runtime
 
 # ...or generate every image from the pinned sources (Python 3 + numpy)
@@ -196,14 +203,3 @@ The server serves both `POST /v1/chat/completions` and
 separate `reasoning_content` from `content`. The Python process implements
 only HTTP and template adaptation — inference stays inside the resident
 C/Metal process.
-
-## Notes
-
-- Model weights and the packed images are not committed; every packer
-  re-checks the pinned SHA-256 values before writing, and the runtime
-  rejects the wrong model or format instead of attempting compatibility
-  fallback.
-- The model identifier served is `qwen3.8-27b`; the compiled image
-  collection for this model lives on Hugging Face as
-  `huangfcn/Qwen3.8-27B-DFlash2-Metal`.
-- This repository is extracted from the larger `llm-in-c` effort.
