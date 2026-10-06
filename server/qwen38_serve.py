@@ -1145,6 +1145,22 @@ class Handler(BaseHTTPRequestHandler):
                     self.sse_event("response.output_text.delta", {
                         "item_id": message_id, "output_index": 0,
                         "content_index": 0, "delta": visible})
+            # Flush the ToolCallSplitter's held-back partial-marker buffer, or
+            # the streamed output_text.delta drops the reply's tail (the final
+            # `output` below is built from the raw answer and stays complete,
+            # but live streaming clients see a truncated/stalled reply).
+            leftover = splitter.flush()
+            if leftover:
+                if not opened[0]:
+                    opened[0] = True
+                    self.sse_event("response.output_item.added", {
+                        "output_index": 0,
+                        "item": {"type": "message", "id": message_id,
+                                 "status": "in_progress",
+                                 "role": "assistant", "content": []}})
+                self.sse_event("response.output_text.delta", {
+                    "item_id": message_id, "output_index": 0,
+                    "content_index": 0, "delta": leftover})
             output = self.responses_output("".join(answer), table, identifier)
             calls = [item["name"] for item in output
                      if item["type"] == "function_call"]
@@ -1274,6 +1290,15 @@ class Handler(BaseHTTPRequestHandler):
                     emit(tail)
                 else:
                     event(chunk({"reasoning_content": tail}))
+            # Flush the ToolCallSplitter too: it holds back trailing bytes that
+            # might begin <tool_call>. Without this the tail of every
+            # tool-enabled reply is stranded -> truncated output / the
+            # conversation appears to stall mid-reply. Must run AFTER the
+            # splitter.flush()/emit(tail) above, since emit() also feeds tools.
+            if tools:
+                leftover = tools.flush()
+                if leftover:
+                    event(chunk({"content": leftover}))
             finish = stats.get("stop", "stop")
             calls = self.chat_tool_calls("".join(answer), table,
                                          identifier) if table else []
